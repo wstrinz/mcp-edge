@@ -1,0 +1,16 @@
+{
+  "originalArtifactsPreserved": [
+    {
+      "archive": "wiskit-edge-poc.zip",
+      "bytes": 41880,
+      "sha256": "ef1094591e4eaabd4e639c8cd20a05e5575eaddb4b9e3172f3e6724781f04e23",
+      "sourceEntriesUnchanged": 12
+    },
+    {
+      "archive": "claude-compat.zip",
+      "bytes": 26713,
+      "sha256": "692d944cd204e20323d5c1216442491ad049dc95915a1d80601388f9a27b3722",
+      "sourceEntriesUnchanged": 11
+    }
+  ]
+}

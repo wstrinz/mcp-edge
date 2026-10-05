@@ -1,0 +1,29 @@
+# Private build/test definition. No public domain, proxy network or host port.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      WISKIT_GATEWAY_MODE: deny-all
+    network_mode: none
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.25
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test: [CMD, /gateway, --healthcheck]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"

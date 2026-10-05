@@ -1,0 +1,33 @@
+warn: could not canonicalize path: 'C:\Users\wstri'
+   Compiling wiskit-gateway-inert v0.1.0 (C:\Users\wstri\Documents\Codex\2026-10-05\task-2\gateway-deploy)
+    Finished `test` profile [unoptimized] target(s) in 4.21s
+     Running unittests src\lib.rs (target\debug\deps\wiskit_gateway_inert-1e661a2110499d9f.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\wiskit_gateway_inert-58e08573cc60aa50.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\inert.rs (target\debug\deps\inert-a91370d5e7b696c9.exe)
+
+running 6 tests
+test configuration_cannot_enable_forwarding ... ok
+test denied_body_is_not_awaited_and_unread_body_cannot_pipeline_health ... ok
+test absolute_destinations_connect_duplicate_hosts_and_oversize_headers_are_rejected ... ok
+test connection_capacity_is_bounded_and_capacity_returns_on_shutdown ... ok
+test alive_does_not_mean_ready_or_mcp_and_secrets_are_not_reflected ... ok
+test slow_headers_have_a_deadline_and_shutdown_closes_pending_connections ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.02s
+
+   Doc-tests wiskit_gateway_inert
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

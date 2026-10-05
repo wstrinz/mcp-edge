@@ -1,0 +1,5 @@
+warn: could not canonicalize path: 'C:\Users\wstri'
+    Finished `dev` profile [unoptimized] target(s) in 2.19s
+     Running `target\debug\wiskit-edge-poc.exe`
+loopback synthetic transport: 200 OK
+{"id":1,"jsonrpc":"2.0","result":{"echo":{"id":1,"jsonrpc":"2.0","method":"tools/call","params":{"arguments":{},"name":"synthetic_echo"}},"synthetic":true}}

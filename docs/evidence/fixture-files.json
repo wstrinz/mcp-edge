@@ -1,0 +1,94 @@
+[
+  {
+    "path": "fixtures/claude-compat/.gitignore",
+    "sha256": "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+  },
+  {
+    "path": "fixtures/claude-compat/Cargo.lock",
+    "sha256": "ab17527b2998274876af90064f0b66150d77ccb080f1693d0b1c40b541a98630"
+  },
+  {
+    "path": "fixtures/claude-compat/Cargo.toml",
+    "sha256": "04926b5b3fca3a5d07e2b68da6dd925efc5222e252172a9d91291a96579401fd"
+  },
+  {
+    "path": "fixtures/claude-compat/README.md",
+    "sha256": "84a343f5b39435304c33390bf1da1f65539f7936970408fda2f181a675accf1b"
+  },
+  {
+    "path": "fixtures/claude-compat/VERIFICATION.md",
+    "sha256": "155d26d786046a46676e127918b96891bac2b25caa5aac4fa5826fbd06546f65"
+  },
+  {
+    "path": "fixtures/claude-compat/clippy.log",
+    "sha256": "f34df8ca898f889af7e0ca17783f8f16279050be4894ab3e435e8b279e3e8b65"
+  },
+  {
+    "path": "fixtures/claude-compat/compatibility-test.log",
+    "sha256": "562f95e250d7c90db31b603acb0d31319906a6a8556c553c683311a0a0454705"
+  },
+  {
+    "path": "fixtures/claude-compat/format.log",
+    "sha256": "5cfa7c33136a49545b94d44f24c394928fac6fe6cead25552604063b5deb9fa2"
+  },
+  {
+    "path": "fixtures/claude-compat/src/lib.rs",
+    "sha256": "b184785551e3d7ef33269561faf9855791a43c86e8e04a07648a1a63edbe328e"
+  },
+  {
+    "path": "fixtures/claude-compat/tests/boundary.rs",
+    "sha256": "150bb6752d8590b67de2d41cd6352fd69af1ef97cbd41542e303206b29975852"
+  },
+  {
+    "path": "fixtures/claude-compat/tests/compatibility.rs",
+    "sha256": "f24e0a198575c1796605f18c67fd981ea5c3a2d331eeaabc9ce4a680e9e4ddf7"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/.gitignore",
+    "sha256": "32612892f1c9e15fe772b8034945f8072b83e025153aef597e45d5eccbe98c43"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/Cargo.lock",
+    "sha256": "d6acc232cf2c34df7029dd325d2a2c4dfb9c3adb78e503aa7a143523528b0a06"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/Cargo.toml",
+    "sha256": "ada0c4a137fd71327a0a66aa336e27bec0b4e1d6fc5140d4f23e50ea9c2327e7"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/README.md",
+    "sha256": "88d51be1f849b0b7b94ce532657243cfa33994488aa978fcfc8ae175078b890b"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/VERIFICATION.md",
+    "sha256": "62b494dd220910510e662b13338ee82770c4b3fdc47a009ccb6c8df7c8c911ca"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/clippy.log",
+    "sha256": "b464e993156abe4be715f72a137fc5a78f4e12f34920f8e140aaaff0dd97ebfe"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/demo.log",
+    "sha256": "91e7ce00c09ce08e2f0baec7bd6bf5d42dec0dfd6a51b29a5af1609e226bf602"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/format.log",
+    "sha256": "5cfa7c33136a49545b94d44f24c394928fac6fe6cead25552604063b5deb9fa2"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/src/lib.rs",
+    "sha256": "5bcdd6956da344bbc23e9e7d3e7b7e1735d65684ade4d910db94766eb3b61891"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/src/main.rs",
+    "sha256": "9744f5e21523b1cfe2640b1f95f455ee77d8fcb49b99cef3f0486db8b07b2cb2"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/tests/transport.rs",
+    "sha256": "4aa7419d08aea6976d1d2388f086ee00ba5d33362f06c3b08ea69fa8168ea71d"
+  },
+  {
+    "path": "fixtures/iroh-transport-poc/transport-test.log",
+    "sha256": "9910ea5b75c13c1450cd92703987d0d5a332d7686801bd63bb2a2171cb477898"
+  }
+]

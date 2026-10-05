@@ -1,0 +1,3 @@
+warn: could not canonicalize path: 'C:\Users\wstri'
+    Checking wiskit-claude-compat-fixture v0.1.0 (C:\Users\wstri\Documents\Codex\2026-10-05\task-2\claude-compat)
+    Finished `dev` profile [unoptimized] target(s) in 1.88s

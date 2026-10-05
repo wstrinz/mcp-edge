@@ -1,0 +1,11 @@
+**/target/
+tmp/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.env
+docker-client/
+.codex/
+*.zip

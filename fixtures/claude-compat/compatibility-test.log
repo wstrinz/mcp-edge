@@ -1,0 +1,41 @@
+warn: could not canonicalize path: 'C:\Users\wstri'
+   Compiling wiskit-claude-compat-fixture v0.1.0 (C:\Users\wstri\Documents\Codex\2026-10-05\task-2\claude-compat)
+    Finished `test` profile [unoptimized] target(s) in 3.56s
+     Running unittests src\lib.rs (target\debug\deps\wiskit_claude_compat_fixture-33635072125fdcfd.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\boundary.rs (target\debug\deps\boundary-30f7d744372bb42e.exe)
+
+running 3 tests
+test authorize_refuses_plain_pkce_redirect_changes_and_write_scope ... ok
+test query_tokens_untrusted_origins_and_http_approval_cannot_dispatch ... ok
+test revocation_endpoint_is_idempotent_and_client_bound ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\compatibility.rs (target\debug\deps\compatibility-7c2a0b4c28528355.exe)
+
+running 11 tests
+test consent_requires_local_owner_browser_binding_and_specific_trackers ... ok
+test discovery_challenge_and_claude_cimd_selection ... ok
+test registration_redirects_cimd_urls_and_duplicate_forms_fail_closed ... ok
+test redacted_audit_and_audit_failure_never_dispatch_data ... ok
+test dcr_and_cimd_code_pkce_round_trips_are_single_use ... ok
+test refresh_rotates_stays_bound_and_replay_revokes_the_family ... ok
+test expiry_revocation_and_restart_fail_closed ... ok
+test legacy_initialize_stateless_headers_tools_and_notifications ... ok
+test consent_grants_do_not_merge_even_for_same_public_cimd_client ... ok
+test pkce_client_redirect_resource_and_code_expiry_are_bound ... ok
+test registration_and_pending_consent_are_bounded ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests wiskit_claude_compat_fixture
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

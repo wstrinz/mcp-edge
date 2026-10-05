@@ -1,0 +1,13 @@
+warn: could not canonicalize path: 'C:\Users\wstri'
+    Checking chacha20 v0.10.2
+    Checking rand v0.10.1
+    Checking n0-dns-resolver v0.1.0
+    Checking noq-proto v1.3.0
+    Checking iroh-base v1.3.0
+    Checking tokio-websockets v0.13.2
+    Checking iroh-dns v1.3.0
+    Checking noq v1.3.0
+    Checking iroh-relay v1.3.0
+    Checking iroh v1.3.0
+    Checking wiskit-edge-poc v0.1.0 (C:\Users\wstri\Documents\Codex\2026-10-05\task-2)
+    Finished `dev` profile [unoptimized] target(s) in 23.83s
