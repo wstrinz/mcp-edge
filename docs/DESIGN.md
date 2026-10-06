@@ -183,10 +183,16 @@ below was taken.
 - The owner id (`sub`) is a random UUID created on first start.
 
 **Codes and tokens**
-- `resource` is required at `/authorize` and must equal `<issuer>/<backend>/mcp`
-  exactly (no normalization). At `/token` it is optional; if present it must match, or
-  the result is `invalid_grant` (the checklist's code, rather than RFC 8707's
-  `invalid_target`). `redirect_uri` is required at `/token` and must match exactly.
+- `resource` is required at `/authorize` and must name `<issuer>/<backend>/mcp`. Both
+  sides are normalized before an exact comparison: scheme and host lowercased, default
+  port dropped, dot segments resolved, one trailing `/` removed; query, fragment and
+  userinfo are refused. At `/token` it is optional; if present it must match, or the
+  result is `invalid_grant` (the checklist's code, rather than RFC 8707's
+  `invalid_target`). `redirect_uri` at `/token` is optional (PKCE plus the client
+  binding already tie the code to its client) but must match exactly when present.
+- Scopes: a requested `scope` is intersected with the backend's scopes; if nothing
+  overlaps, the backend's default scopes are granted (no `invalid_scope`), so clients
+  that send unrelated scopes still connect. Grants never exceed the backend's scopes.
 - Any presentation of a code consumes it: a failed exchange (wrong verifier, client,
   redirect, resource, expiry) burns the code and its pending grant; presenting an
   already-used code also revokes the grant it produced.
@@ -204,8 +210,12 @@ below was taken.
   after creation; never-used client registrations are pruned after 1 hour when the
   100-client cap is reached.
 - DCR accepts at most 4 redirect URIs, all exact allowlist members; unknown metadata
-  is ignored; `client_name` is stripped of control characters, cut to 80 characters
-  and always HTML-escaped.
+  is ignored; any requested `token_endpoint_auth_method` is substituted with `none`
+  (RFC 7591 §3.2.1) and returned as such; `client_name` is stripped of control
+  characters, cut to 80 characters and always HTML-escaped. Registrations from all
+  Claude users may share Anthropic egress addresses, so there is effectively no global
+  registration rate cap (10 000 per hour); the per-IP limit is 20 per hour and the
+  100-client cap with pruning bounds storage.
 
 **Assertions**
 - The signature covers `"edge-assert.v1." + <payload segment>`; `req` is
@@ -235,7 +245,7 @@ below was taken.
   header intermittently — fixed there too); bodies 16 KiB (OAuth forms), 64 KiB
   (WebAuthn), per-backend MCP cap (default 1 MiB, echo 64 KiB). Per client IP per
   minute: 600 requests, 30 authorize, 60 token/revoke, 20 owner ceremonies; 10
-  registrations per hour per IP and 60 globally; 300 MCP requests per grant per minute.
+  registrations per hour per IP; 300 MCP requests per grant per minute.
   Anonymous state never refuses the owner (found in review: a refusing cap let one
   anonymous IP lock the owner out of login and consent). WebAuthn ceremonies (~1 KiB)
   are capped at 4 per client network and 4096 overall; when full, anonymous logins are

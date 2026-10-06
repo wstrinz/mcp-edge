@@ -751,13 +751,9 @@ fn register_inner(
     {
         return Err(oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri"));
     }
-    if req
-        .token_endpoint_auth_method
-        .as_deref()
-        .is_some_and(|m| m != "none")
-    {
-        return Err(bad());
-    }
+    // RFC 7591 §3.2.1: the server may substitute metadata. Whatever method is
+    // requested, the client is registered (and told it is) public: "none".
+    let _ = req.token_endpoint_auth_method;
     let grant_types = req
         .grant_types
         .unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]);
@@ -874,14 +870,21 @@ fn authorize_inner(s: &AuthState, ip: Option<std::net::IpAddr>, query: &str) -> 
         .ok_or_else(|| fail("invalid_target"))?;
     let scope = match get("scope") {
         None => backend.scopes.join(" "),
+        // Grant the intersection with the backend's scopes; if nothing
+        // overlaps, grant the backend's defaults (clients often send scopes
+        // from other servers or none we know).
         Some(requested) => {
-            let mut wanted: Vec<&str> = requested.split(' ').filter(|x| !x.is_empty()).collect();
+            let mut wanted: Vec<&str> = requested
+                .split(' ')
+                .filter(|x| backend.scopes.iter().any(|b| b == x))
+                .collect();
             wanted.sort_unstable();
             wanted.dedup();
-            if wanted.is_empty() || !wanted.iter().all(|w| backend.scopes.iter().any(|b| b == w)) {
-                return Err(fail("invalid_scope"));
+            if wanted.is_empty() {
+                backend.scopes.join(" ")
+            } else {
+                wanted.join(" ")
             }
-            wanted.join(" ")
         }
     };
 
@@ -1495,7 +1498,9 @@ fn token_inner(
         Some("authorization_code") => {
             let code = get("code").ok_or_else(invalid_grant)?;
             let verifier = get("code_verifier").ok_or_else(invalid_grant)?;
-            let redirect_uri = get("redirect_uri").ok_or_else(invalid_grant)?;
+            // Optional (PKCE and the client binding already tie the code to
+            // this client); exact match when present.
+            let redirect_uri = get("redirect_uri");
             let row = match s.db("codes", s.0.store.take_code(&hash_secret(code)))? {
                 CodeTake::Missing => return Err(invalid_grant()),
                 CodeTake::Reused(grant_id) => {
@@ -1515,7 +1520,7 @@ fn token_inner(
             };
             let ok = row.expires > now
                 && row.client_id == client_id
-                && row.redirect_uri == redirect_uri
+                && redirect_uri.is_none_or(|r| r == row.redirect_uri)
                 && resource_ok
                 && valid_verifier(verifier)
                 && pkce_s256_matches(verifier, &row.challenge);

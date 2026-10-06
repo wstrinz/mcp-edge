@@ -64,8 +64,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            register_per_ip_per_hour: 10,
-            register_global_per_hour: 60,
+            register_per_ip_per_hour: 20,
+            register_global_per_hour: 10_000,
             authorize_per_ip_per_minute: 30,
             token_per_ip_per_minute: 60,
             owner_per_ip_per_minute: 20,
@@ -100,11 +100,13 @@ impl AuthConfig {
         format!("{}/{backend}/mcp", self.issuer)
     }
 
-    /// Map a `resource` parameter to a configured backend (exact match only).
+    /// Map a `resource` parameter to a configured backend. Both sides are
+    /// normalized ([`normalize_resource`]) before an exact comparison.
     pub fn backend_for_resource(&self, resource: &str) -> Option<&BackendPolicy> {
+        let wanted = normalize_resource(resource)?;
         self.backends
             .iter()
-            .find(|b| self.resource_url(&b.id) == resource)
+            .find(|b| normalize_resource(&self.resource_url(&b.id)).as_deref() == Some(&wanted))
     }
 
     pub fn resource_metadata_url(&self, backend: &str) -> String {
@@ -112,5 +114,58 @@ impl AuthConfig {
             "{}/.well-known/oauth-protected-resource/{backend}/mcp",
             self.issuer
         )
+    }
+}
+
+/// Canonical form of a resource indicator: scheme and host lowercased, default
+/// port dropped, dot segments resolved (all by the URL parser), and one
+/// trailing `/` removed. Query, fragment and userinfo are not allowed.
+pub fn normalize_resource(resource: &str) -> Option<String> {
+    let url = url::Url::parse(resource).ok()?;
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return None;
+    }
+    let mut out = url.as_str().to_string();
+    if url.path() != "/" && out.ends_with('/') {
+        out.pop();
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_resource;
+
+    #[test]
+    fn resource_normalization() {
+        let canonical = Some("https://edge.test/echo/mcp".to_string());
+        for variant in [
+            "https://edge.test/echo/mcp",
+            "HTTPS://EDGE.TEST/echo/mcp",
+            "https://edge.test:443/echo/mcp",
+            "https://edge.test/echo/mcp/",
+        ] {
+            assert_eq!(normalize_resource(variant), canonical, "{variant}");
+        }
+        for different in [
+            "https://edge.test/ECHO/mcp",
+            "https://edge.test:8443/echo/mcp",
+            "http://edge.test/echo/mcp",
+            "https://edge.test/echo/mcp//",
+        ] {
+            assert_ne!(normalize_resource(different), canonical, "{different}");
+        }
+        for invalid in [
+            "https://edge.test/echo/mcp?x=1",
+            "https://u@edge.test/echo/mcp",
+            "mcp",
+        ] {
+            assert_eq!(normalize_resource(invalid), None, "{invalid}");
+        }
     }
 }

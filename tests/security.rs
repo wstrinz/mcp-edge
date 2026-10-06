@@ -544,7 +544,6 @@ async fn checklist_2_bad_authorization_requests_never_yield_codes() {
             good.replace(&format!("&resource={}", url_encode(&resource("echo"))), ""),
             "invalid_target",
         ),
-        (format!("{good}&scope=admin"), "invalid_scope"),
     ] {
         let res = h.get(&mut b, &query).await;
         assert_eq!(res.status(), 303, "{query}");
@@ -558,7 +557,6 @@ async fn checklist_2_bad_authorization_requests_never_yield_codes() {
     for body in [
         json!({ "redirect_uris": ["https://evil.test/cb"] }),
         json!({ "redirect_uris": [] }),
-        json!({ "redirect_uris": [CALLBACK], "token_endpoint_auth_method": "client_secret_basic" }),
         json!({ "redirect_uris": [CALLBACK], "grant_types": ["client_credentials"] }),
         json!({ "redirect_uris": [CALLBACK], "response_types": ["token"] }),
     ] {
