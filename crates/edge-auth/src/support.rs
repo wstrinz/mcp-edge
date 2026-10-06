@@ -176,7 +176,8 @@ impl RateLimiter {
     }
 }
 
-pub(crate) fn network_key(ip: IpAddr) -> IpAddr {
+/// The address used to group a client for limits (IPv6 by /64).
+pub fn network_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

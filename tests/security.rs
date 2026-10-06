@@ -390,6 +390,54 @@ async fn floods_from_many_networks_never_evict_owner_progress() {
     h.finish().await;
 }
 
+#[tokio::test]
+async fn slow_bodies_time_out_and_in_flight_requests_are_capped_per_network() {
+    let h = Harness::start_with(Options {
+        edge_limits: mcp_edge::app::EdgeLimits {
+            per_ip_concurrent: 2,
+            auth_body_timeout: Duration::from_secs(1),
+            ..Default::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    // Two slowloris bodies from one network occupy its in-flight slots.
+    let slow = "POST /token HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.9\r\n\
+                Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 100\r\n\r\ngrant";
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut s = TcpStream::connect(h.addr).await.unwrap();
+        s.write_all(slow.as_bytes()).await.unwrap();
+        held.push(s);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let metadata = |xff: &'static str| {
+        h.http
+            .get(h.url("/.well-known/oauth-authorization-server"))
+            .header("x-forwarded-for", xff)
+            .send()
+    };
+    assert_eq!(metadata("198.51.100.9").await.unwrap().status(), 429);
+    // Other networks and the health check are unaffected.
+    assert_eq!(metadata("198.51.100.10").await.unwrap().status(), 200);
+    assert_eq!(
+        h.http.get(h.url("/healthz")).send().await.unwrap().status(),
+        200
+    );
+    // The slow bodies hit the body deadline and free their slots.
+    for mut s in held {
+        let mut out = vec![0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        let head = String::from_utf8_lossy(&out[..n]).to_string();
+        assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+    }
+    assert_eq!(metadata("198.51.100.9").await.unwrap().status(), 200);
+    h.finish().await;
+}
+
 // ---------------------------------------------------------------- item 2
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 /// Simultaneous connections; further connections are closed immediately.
-pub const MAX_CONNECTIONS: usize = 128;
+pub const MAX_CONNECTIONS: usize = 1024;
 /// Time allowed to send request headers.
 pub const HEADER_DEADLINE: Duration = Duration::from_secs(10);
 /// Hard cap on one connection's lifetime (keep-alive included).

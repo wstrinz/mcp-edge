@@ -30,7 +30,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -38,6 +38,8 @@ use std::{
 pub const ASSERTION_TTL: i64 = 60;
 /// Total request-header bytes accepted.
 pub const MAX_HEADER_BYTES: usize = 32 * 1024;
+/// Largest body any OAuth/owner route accepts (route limits are smaller).
+const AUTH_BODY_LIMIT: usize = 64 * 1024;
 
 /// Limits enforced by the edge itself (the auth crate has its own).
 #[derive(Clone, Debug)]
@@ -48,6 +50,10 @@ pub struct EdgeLimits {
     pub per_grant_per_minute: u32,
     /// Deadline for reading the request and producing a response.
     pub request_timeout: Duration,
+    /// Requests one client network may have in flight at once.
+    pub per_ip_concurrent: usize,
+    /// Deadline for receiving the whole body of a non-MCP (OAuth/owner) request.
+    pub auth_body_timeout: Duration,
 }
 
 impl Default for EdgeLimits {
@@ -56,6 +62,8 @@ impl Default for EdgeLimits {
             per_ip_per_minute: 600,
             per_grant_per_minute: 300,
             request_timeout: Duration::from_secs(30),
+            per_ip_concurrent: 8,
+            auth_body_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -107,6 +115,41 @@ struct Edge {
     backends: HashMap<String, Backend>,
     trusted_proxies: Vec<Cidr>,
     limits: EdgeLimits,
+    inflight: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// Holds one in-flight slot for a client network; released on drop (also when
+/// the request future is cancelled by a deadline or a closed connection).
+struct InflightSlot {
+    edge: Arc<Edge>,
+    net: IpAddr,
+}
+
+impl InflightSlot {
+    fn acquire(edge: &Arc<Edge>, net: IpAddr) -> Option<Self> {
+        let mut map = edge.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(net).or_insert(0);
+        if *count >= edge.limits.per_ip_concurrent.max(1) {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            edge: edge.clone(),
+            net,
+        })
+    }
+}
+
+impl Drop for InflightSlot {
+    fn drop(&mut self) {
+        let mut map = self.edge.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.net) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.net);
+            }
+        }
+    }
 }
 
 pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
@@ -155,6 +198,7 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
         backends,
         trusted_proxies: cfg.trusted_proxies,
         limits: cfg.edge_limits,
+        inflight: Mutex::new(HashMap::new()),
     });
     let gateway = Router::new()
         .route("/healthz", get(healthz))
@@ -255,7 +299,37 @@ async fn guard(State(edge): State<Arc<Edge>>, mut req: Request, next: Next) -> R
             .insert("retry-after", HeaderValue::from_static("60"));
         return res;
     }
-    let mut res = match tokio::time::timeout(edge.limits.request_timeout, next.run(req)).await {
+    // Slow-request defence (Traefik streams bodies through): a client network
+    // holds at most `per_ip_concurrent` requests in flight, and OAuth/owner
+    // bodies must arrive within `auth_body_timeout`.
+    let is_health = req.uri().path() == "/healthz";
+    let _slot = match ip {
+        Some(ip) if !is_health => {
+            match InflightSlot::acquire(&edge, edge_auth::support::network_key(ip)) {
+                Some(slot) => Some(slot),
+                None => return json_error(StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"),
+            }
+        }
+        _ => None,
+    };
+    let is_mcp = req
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|m| m.as_str() == "/{backend}/mcp");
+    let deadline = tokio::time::Instant::now() + edge.limits.request_timeout;
+    if !is_mcp && req.method() != Method::GET && req.method() != Method::HEAD {
+        let (parts, body) = req.into_parts();
+        let limited = http_body_util::Limited::new(body, AUTH_BODY_LIMIT);
+        let bytes = match tokio::time::timeout(edge.limits.auth_body_timeout, limited.collect())
+            .await
+        {
+            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(_)) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large"),
+            Err(_) => return json_error(StatusCode::REQUEST_TIMEOUT, "request_timeout"),
+        };
+        req = Request::from_parts(parts, Body::from(bytes));
+    }
+    let mut res = match tokio::time::timeout_at(deadline, next.run(req)).await {
         Ok(res) => res,
         Err(_) => json_error(StatusCode::SERVICE_UNAVAILABLE, "timeout"),
     };

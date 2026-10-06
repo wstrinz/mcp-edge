@@ -88,6 +88,23 @@ The `edge-data` volume holds the grant store and the assertion signing key; back
 up if grants should survive a rebuilt volume. Losing it revokes everything and
 requires a new `EDGE_ENROLL_CODE` enrollment and a new key for backends.
 
+### Optional: Traefik request buffering
+
+Traefik streams request bodies to the container. The edge already bounds slow
+clients (8 in-flight requests per client network, 5 s body deadline on OAuth/owner
+routes, 30 s overall), but Traefik can also buffer whole requests before they reach
+the edge. In Coolify, add custom labels to the `edge` service (replace `<router>`
+with the router name Coolify generated for the domain, visible in its labels view):
+
+```text
+traefik.http.middlewares.mcp-edge-buffer.buffering.maxRequestBodyBytes=4194304
+traefik.http.middlewares.mcp-edge-buffer.buffering.memRequestBodyBytes=1048576
+traefik.http.routers.<router>.middlewares=mcp-edge-buffer
+```
+
+This is not in `compose.yaml` because Coolify owns the router names. Check that
+other middlewares Coolify attached (e.g. redirect to HTTPS) are kept in that list.
+
 ## Local checks
 
 ```powershell

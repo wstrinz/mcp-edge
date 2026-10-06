@@ -221,7 +221,13 @@ below was taken.
   2025-11-25, 2025-06-18 or 2025-03-26 (default 2025-06-18); an `MCP-Protocol-Version`
   header, if present, must be one of these; batches are rejected; notifications get 202.
   The bearer token is checked before the body is read.
-- Limits: 128 connections; 10 s header deadline; 5 min connection lifetime; 30 s
+- Slow requests: Traefik streams request bodies, so a slowloris body reaches the edge.
+  Each client network may have at most 8 requests in flight (`/healthz` exempt), and
+  any non-MCP request body (OAuth forms, WebAuthn JSON) must arrive within 5 s (408)
+  and fit 64 KiB before routing; MCP bodies are read only after authentication within
+  the overall deadline. An optional Traefik `buffering` middleware is documented in
+  the README.
+- Limits: 1024 connections; 10 s header deadline; 5 min connection lifetime; 30 s
   request deadline; 32 KiB of request headers (enforced explicitly: hyper's read-buffer
   limit is not a strict cap, which also let the old deny-all server serve a 32 KiB
   header intermittently — fixed there too); bodies 16 KiB (OAuth forms), 64 KiB
