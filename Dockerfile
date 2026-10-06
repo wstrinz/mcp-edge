@@ -11,6 +11,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY src ./src
 COPY tests ./tests
+# config/routes.toml is also compiled into a unit test (include_str!), not only copied into the image.
+COPY config ./config
 RUN cargo fetch --locked
 RUN --network=none set -eu; \
     cargo test --locked --offline --release --workspace; \
