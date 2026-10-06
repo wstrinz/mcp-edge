@@ -172,10 +172,12 @@ below was taken.
   Pages send a strict CSP whose `form-action` also lists the redirect-allowlist
   origins (the consent POST answers with a redirect there).
 - Enrollment: the code must be ≥ 16 ASCII characters (otherwise ignored, enrollment
-  disabled); it is compared in constant time, and stored only as a hash when consumed,
-  in the same transaction as the first passkey. Once any passkey exists codes are never
-  accepted again. 10 wrong codes lock enrollment for the rest of a 15-minute window
-  (global; bounds guessing, and a stranger can delay enrollment only briefly). Adding passkeys needs an owner session
+  disabled); it is compared as SHA-256 digests in constant time (no length leak), and
+  stored only as a hash when consumed, in the same transaction as the first passkey.
+  Once any passkey exists codes are never accepted again. Wrong codes are limited to 10
+  per client network per 15 minutes and 100 across all networks per hour; both locks
+  lift by themselves, and check-compare-increment happens under one lock. A stranger
+  can no longer block the owner's network, and guessing stays bounded globally. Adding passkeys needs an owner session
   authenticated within 5 minutes. There is no passkey removal yet; recovery from lost
   passkeys is "wipe the volume, enroll again", which also revokes everything.
 - The owner id (`sub`) is a random UUID created on first start.

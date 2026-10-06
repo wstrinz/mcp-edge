@@ -282,6 +282,49 @@ async fn enrollment_is_disabled_without_a_code_and_locks_after_failures() {
 }
 
 #[tokio::test]
+async fn enrollment_lock_is_per_network_with_a_global_ceiling() {
+    let h = Harness::start_with(Options {
+        auth_limits: Limits {
+            max_enroll_failures: 2,
+            max_enroll_failures_global: 5,
+            ..Limits::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    let attempt = |ip: &str, code: &str| {
+        let mut b = Browser::from_ip(ip);
+        let body = json!({ "enroll_code": code });
+        let h = &h;
+        async move {
+            h.post_json(&mut b, "/owner/register/start", &body)
+                .await
+                .status()
+                .as_u16()
+        }
+    };
+    let wrong = "SYNTHETIC-wrong-code-0000000000";
+    // Network A locks itself out...
+    assert_eq!(attempt("198.51.100.1", wrong).await, 403);
+    assert_eq!(attempt("198.51.100.1", wrong).await, 403);
+    assert_eq!(attempt("198.51.100.1", ENROLL_CODE).await, 429);
+    // ...without locking out the owner on network B.
+    assert_eq!(attempt("203.0.113.7", ENROLL_CODE).await, 200);
+    // A shorter or longer wrong code is rejected the same way (digest compare).
+    assert_eq!(attempt("198.51.100.2", "x").await, 403);
+    assert_eq!(
+        attempt("198.51.100.3", &format!("{ENROLL_CODE}x")).await,
+        403
+    );
+    assert_eq!(attempt("198.51.100.4", wrong).await, 403);
+    // Five failures across networks reach the global ceiling.
+    assert_eq!(attempt("203.0.113.7", ENROLL_CODE).await, 429);
+    h.clock.advance(60 * 60);
+    assert_eq!(attempt("203.0.113.7", ENROLL_CODE).await, 200);
+    h.finish().await;
+}
+
+#[tokio::test]
 async fn anonymous_floods_cannot_fill_ceremony_or_pending_tables() {
     let mut h = Harness::start().await;
     h.enroll().await;

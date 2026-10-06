@@ -55,8 +55,10 @@ pub struct Limits {
     pub max_ceremonies: usize,
     /// Registered clients; unused old registrations are pruned first.
     pub max_clients: usize,
-    /// Failed enrollment-code attempts before enrollment locks until restart.
+    /// Wrong enrollment codes per client network per 15 minutes.
     pub max_enroll_failures: u32,
+    /// Wrong enrollment codes across all networks per hour.
+    pub max_enroll_failures_global: u32,
 }
 
 impl Default for Limits {
@@ -71,6 +73,7 @@ impl Default for Limits {
             max_ceremonies: 4096,
             max_clients: 100,
             max_enroll_failures: 10,
+            max_enroll_failures_global: 100,
         }
     }
 }

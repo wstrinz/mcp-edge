@@ -62,8 +62,18 @@ const SESSION_COOKIE: &str = "__Host-edge_sid";
 const MAX_CEREMONIES_PER_NET: usize = 4;
 /// Live pending authorization requests one client network may hold.
 const MAX_PENDING_PER_NET: i64 = 4;
-/// Enrollment-code failures are counted in windows of this length.
+/// Per-network enrollment-code failures are counted in windows of this length.
 const ENROLL_LOCK_WINDOW: i64 = 15 * 60;
+/// Global enrollment-code failures are counted in windows of this length.
+const ENROLL_GLOBAL_WINDOW: i64 = 60 * 60;
+
+#[derive(Default)]
+struct EnrollFailures {
+    /// network -> (window start, failures)
+    per_net: HashMap<Option<std::net::IpAddr>, (i64, u32)>,
+    /// (window start, failures)
+    global: (i64, u32),
+}
 const MAX_REDIRECT_URIS: usize = 4;
 const MAX_STATE_LEN: usize = 512;
 const MAX_TOKEN_LEN: usize = 256;
@@ -139,8 +149,7 @@ struct Inner {
     ceremonies: Mutex<HashMap<String, Ceremony>>,
     ceremony_seq: AtomicU64,
     csrf_key: [u8; 32],
-    /// (window start, failures in that window)
-    enroll_failures: Mutex<(i64, u32)>,
+    enroll_failures: Mutex<EnrollFailures>,
     owner_id: String,
     issuer_origin: String,
     issuer_host: String,
@@ -332,7 +341,7 @@ impl AuthState {
             ceremonies: Mutex::new(HashMap::new()),
             csrf_key: random_bytes::<32>(),
             ceremony_seq: AtomicU64::new(0),
-            enroll_failures: Mutex::new((0, 0)),
+            enroll_failures: Mutex::new(EnrollFailures::default()),
             owner_id,
             csp,
         })))
@@ -1208,26 +1217,36 @@ fn register_start_inner(
         let Some(configured) = s.0.enroll_code.as_deref() else {
             return Err(oauth_error(StatusCode::FORBIDDEN, "enrollment_disabled"));
         };
-        // At most `max_enroll_failures` wrong codes per 15-minute window; the
-        // lock lifts by itself (no restart), which bounds guessing without
-        // letting a stranger block enrollment for long.
-        let max = s.config().limits.max_enroll_failures;
+        // Wrong codes are limited per client network (`max_enroll_failures`
+        // per 15 min) and globally (`max_enroll_failures_global` per hour).
+        // Locks lift by themselves. The check, comparison and increment all
+        // happen under one lock, so parallel guesses cannot overshoot.
+        let limits = &s.config().limits;
+        let net = ip.map(support::network_key);
         let mut failures =
             s.0.enroll_failures
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-        if now - failures.0 >= ENROLL_LOCK_WINDOW {
-            *failures = (now, 0);
+        failures
+            .per_net
+            .retain(|_, (start, _)| now - *start < ENROLL_LOCK_WINDOW);
+        if now - failures.global.0 >= ENROLL_GLOBAL_WINDOW {
+            failures.global = (now, 0);
         }
-        if failures.1 >= max {
+        let net_failures = failures.per_net.get(&net).map_or(0, |(_, n)| *n);
+        if net_failures >= limits.max_enroll_failures
+            || failures.global.1 >= limits.max_enroll_failures_global
+        {
             return Err(oauth_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "enrollment_locked",
             ));
         }
+        // Compare digests: constant time and independent of the code's length.
         let provided = req.enroll_code.unwrap_or_default();
-        if !ct_eq(&provided, configured) {
-            failures.1 += 1;
+        if !ct_eq(&hash_secret(&provided), &hash_secret(configured)) {
+            failures.per_net.entry(net).or_insert((now, 0)).1 += 1;
+            failures.global.1 += 1;
             drop(failures);
             s.log("event=enroll_code_rejected");
             return Err(oauth_error(
