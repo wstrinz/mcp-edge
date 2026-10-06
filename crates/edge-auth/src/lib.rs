@@ -75,6 +75,9 @@ struct EnrollFailures {
     global: (i64, u32),
 }
 const MAX_REDIRECT_URIS: usize = 4;
+/// An immediately-previous refresh token re-presented by the same client this
+/// soon after rotation continues the family instead of revoking it.
+const REFRESH_GRACE: i64 = 30;
 const MAX_STATE_LEN: usize = 512;
 const MAX_TOKEN_LEN: usize = 256;
 
@@ -1562,12 +1565,18 @@ fn token_inner(
                     now + ACCESS_TTL,
                     &hash_secret(&refresh),
                     now,
+                    REFRESH_GRACE,
                 ),
             )?;
             // A `scope` parameter is ignored: refreshed tokens always carry
             // exactly the grant's scope, so refresh can never widen it.
             match outcome {
-                RefreshOutcome::Rotated(g) => g,
+                RefreshOutcome::Rotated { grant, grace } => {
+                    if grace {
+                        s.log(&format!("event=refresh_grace grant={}", grant.id));
+                    }
+                    grant
+                }
                 RefreshOutcome::FamilyRevoked(grant_id) => {
                     s.log(&format!(
                         "event=refresh_reuse grant={grant_id} action=family_revoked"

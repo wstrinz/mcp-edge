@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS codes (
 CREATE TABLE IF NOT EXISTS access_tokens (
     hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS refresh_tokens (
-    hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL);
+    hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL,
+    rotated_at INTEGER, successor TEXT);
 CREATE INDEX IF NOT EXISTS access_by_grant ON access_tokens(grant_id);
 CREATE INDEX IF NOT EXISTS refresh_by_grant ON refresh_tokens(grant_id);
 "#;
@@ -96,7 +97,12 @@ pub enum CodeTake {
 }
 
 pub enum RefreshOutcome {
-    Rotated(GrantRow),
+    /// New pair issued; `grace` when an immediately-previous token was
+    /// re-presented within the grace window.
+    Rotated {
+        grant: GrantRow,
+        grace: bool,
+    },
     Missing,
     /// A rotated token was presented again (or by another client): the whole
     /// grant was revoked.
@@ -547,17 +553,18 @@ impl Store {
         access_expires: i64,
         refresh_hash: &str,
         now: i64,
+        grace_secs: i64,
     ) -> StoreResult<RefreshOutcome> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(String, String)> = tx
+        let row: Option<(String, String, Option<i64>, Option<String>)> = tx
             .query_row(
-                "SELECT grant_id, status FROM refresh_tokens WHERE hash = ?1",
+                "SELECT grant_id, status, rotated_at, successor FROM refresh_tokens WHERE hash = ?1",
                 [old_hash],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((grant_id, status)) = row else {
+        let Some((grant_id, status, rotated_at, successor)) = row else {
             return Ok(RefreshOutcome::Missing);
         };
         let grant = tx
@@ -570,7 +577,25 @@ impl Store {
         let Some(grant) = grant else {
             return Ok(RefreshOutcome::Missing);
         };
-        if status != "active" || grant.client_id != client_id {
+        // Grace: the immediately-previous token, re-presented by the same
+        // client shortly after rotation (a lost response or a retry), continues
+        // the family. "Immediately previous" = its successor is the current
+        // active token.
+        let grace_successor = match (status.as_str(), rotated_at, successor) {
+            ("rotated", Some(at), Some(succ)) if now - at <= grace_secs => {
+                let succ_active: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM refresh_tokens WHERE hash = ?1 AND grant_id = ?2",
+                        params![succ, grant_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                (succ_active.as_deref() == Some("active")).then_some(succ)
+            }
+            _ => None,
+        };
+        let replay = status != "active" && grace_successor.is_none();
+        if replay || grant.client_id != client_id {
             revoke_grant_tx(&tx, &grant_id)?;
             tx.commit()?;
             return Ok(RefreshOutcome::FamilyRevoked(grant_id));
@@ -581,10 +606,29 @@ impl Store {
         if expected_backend.is_some_and(|b| b != grant.backend) {
             return Ok(RefreshOutcome::Inactive);
         }
-        tx.execute(
-            "UPDATE refresh_tokens SET status = 'rotated' WHERE hash = ?1",
-            [old_hash],
-        )?;
+        match &grace_successor {
+            // Retire the current active token in favour of the new one, and
+            // point the re-presented token at it too (its rotated_at stays, so
+            // the grace window does not extend).
+            Some(current) => {
+                tx.execute(
+                    "UPDATE refresh_tokens SET status = 'rotated', rotated_at = ?2, successor = ?3
+                        WHERE hash = ?1",
+                    params![current, now, refresh_hash],
+                )?;
+                tx.execute(
+                    "UPDATE refresh_tokens SET successor = ?2 WHERE hash = ?1",
+                    params![old_hash, refresh_hash],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE refresh_tokens SET status = 'rotated', rotated_at = ?2, successor = ?3
+                        WHERE hash = ?1",
+                    params![old_hash, now, refresh_hash],
+                )?;
+            }
+        }
         tx.execute(
             "INSERT INTO refresh_tokens (hash, grant_id, status, created) VALUES (?1, ?2, 'active', ?3)",
             params![refresh_hash, grant_id, now],
@@ -594,7 +638,10 @@ impl Store {
             params![access_hash, grant_id, access_expires],
         )?;
         tx.commit()?;
-        Ok(RefreshOutcome::Rotated(grant))
+        Ok(RefreshOutcome::Rotated {
+            grant,
+            grace: grace_successor.is_some(),
+        })
     }
 
     /// Resolve an access token to its active grant.

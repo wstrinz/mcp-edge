@@ -199,7 +199,11 @@ below was taken.
 - Public clients only: an `Authorization` header or `client_secret` at `/token` or
   `/revoke` is `invalid_client`, as is an unknown `client_id`.
 - A rotated refresh token presented again, or a refresh token presented by a different
-  client, revokes the whole grant ("family" = grant). Refresh never extends the grant's
+  client, revokes the whole grant ("family" = grant). One exception for lost responses
+  and retries: the immediately-previous token (its successor is the current active
+  token), re-presented by the same client within 30 s of its rotation, gets a fresh
+  pair and the current token is retired; the window is measured from the original
+  rotation and never extends. Refresh never extends the grant's
   absolute lifetime; a `scope` parameter on refresh is ignored (tokens always carry
   exactly the granted scope).
 - `/revoke` (RFC 7009) revokes the whole grant for either token type; tokens of other
@@ -244,7 +248,7 @@ below was taken.
   limit is not a strict cap, which also let the old deny-all server serve a 32 KiB
   header intermittently — fixed there too); bodies 16 KiB (OAuth forms), 64 KiB
   (WebAuthn), per-backend MCP cap (default 1 MiB, echo 64 KiB). Per client IP per
-  minute: 600 requests, 30 authorize, 60 token/revoke, 20 owner ceremonies; 10
+  minute: 600 requests, 30 authorize, 60 token/revoke, 20 owner ceremonies; 20
   registrations per hour per IP; 300 MCP requests per grant per minute.
   Anonymous state never refuses the owner (found in review: a refusing cap let one
   anonymous IP lock the owner out of login and consent). WebAuthn ceremonies (~1 KiB)

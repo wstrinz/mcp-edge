@@ -751,18 +751,32 @@ async fn checklist_4_refresh_replay_revokes_the_family() {
         200
     );
 
-    // Replay of the rotated token: rejected and the whole family dies.
+    // Grace: the immediately-previous token, retried by the same client
+    // within 30 s, continues the family with a fresh pair.
+    let (status, t3) = h.refresh(&client, &r1).await;
+    assert_eq!(status, 200, "{t3}");
+    let r3 = t3["refresh_token"].as_str().unwrap().to_string();
+    assert!(h.logs().iter().any(|l| l.contains("event=refresh_grace")));
+    // Normal rotation moves on: r1 is now two generations back.
+    let (status, t4) = h.refresh(&client, &r3).await;
+    assert_eq!(status, 200);
+    let a4 = t4["access_token"].as_str().unwrap().to_string();
+    let r4 = t4["refresh_token"].as_str().unwrap().to_string();
+
+    // Replay of an older rotated token: rejected and the whole family dies.
     let (status, body) = h.refresh(&client, &r1).await;
     assert_eq!(
         (status, body["error"].as_str()),
         (400, Some("invalid_grant"))
     );
-    let (status, body) = h.refresh(&client, &r2).await;
-    assert_eq!(
-        (status, body["error"].as_str()),
-        (400, Some("invalid_grant"))
-    );
-    for token in [&a1, &a2] {
+    for r in [&r2, &r4] {
+        let (status, body) = h.refresh(&client, r).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (400, Some("invalid_grant"))
+        );
+    }
+    for token in [&a1, &a2, &a4] {
         assert_eq!(
             h.mcp("echo", Some(token), &rpc(2, "ping", json!({})))
                 .await
@@ -775,7 +789,21 @@ async fn checklist_4_refresh_replay_revokes_the_family() {
         .iter()
         .any(|l| l.contains("event=refresh_reuse") && l.contains("family_revoked")));
 
-    // A refresh token presented by another client also revokes its family.
+    // The immediately-previous token after the grace window also revokes.
+    let (client_g, tg) = h.tokens_for("echo").await;
+    let rg1 = tg["refresh_token"].as_str().unwrap().to_string();
+    let (status, tg2) = h.refresh(&client_g, &rg1).await;
+    assert_eq!(status, 200);
+    h.clock.advance(31);
+    let (status, _) = h.refresh(&client_g, &rg1).await;
+    assert_eq!(status, 400);
+    let (status, _) = h
+        .refresh(&client_g, tg2["refresh_token"].as_str().unwrap())
+        .await;
+    assert_eq!(status, 400, "family revoked");
+
+    // A refresh token presented by another client also revokes its family,
+    // even inside the grace window.
     let (client_b, t3) = h.tokens_for("echo").await;
     let r3 = t3["refresh_token"].as_str().unwrap().to_string();
     let (status, _) = h.refresh(&client, &r3).await;
