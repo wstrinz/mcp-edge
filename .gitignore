@@ -9,3 +9,6 @@ secrets.env
 docker-client/
 .codex/
 *.zip
+
+# Claude Code agent worktrees (local only)
+.claude/worktrees/
