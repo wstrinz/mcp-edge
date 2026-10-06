@@ -1,14 +1,30 @@
+use edge_auth::{
+    config::Limits,
+    owner::WebauthnOwnerProof,
+    support::{StderrLog, SystemClock},
+};
+use mcp_edge::{
+    app::{self, AppConfig, AppDeps, EdgeLimits},
+    config::{EdgeConfig, DEFAULT_BIND},
+    Mode,
+};
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
+    path::Path,
+    sync::Arc,
     time::Duration,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-// Health check talks only to this container's fixed loopback socket.
+// Health check talks only to this container's own loopback listener.
 fn healthcheck() -> std::io::Result<()> {
-    let socket: SocketAddr = "127.0.0.1:8080".parse().expect("constant socket");
+    let bind: SocketAddr = std::env::var("EDGE_BIND")
+        .unwrap_or_else(|_| DEFAULT_BIND.into())
+        .parse()
+        .map_err(|_| std::io::Error::other("bad EDGE_BIND"))?;
+    let socket = SocketAddr::from(([127, 0, 0, 1], bind.port()));
     let limit = Duration::from_secs(2);
     let mut stream = TcpStream::connect_timeout(&socket, limit)?;
     stream.set_read_timeout(Some(limit))?;
@@ -46,6 +62,130 @@ async fn stopped() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn fail(message: &str) -> ! {
+    eprintln!("mcp-edge: {message}");
+    std::process::exit(1);
+}
+
+/// Load the assertion signing seed, creating it on first start. An existing
+/// file of the wrong size is never replaced silently.
+fn load_or_create_seed(path: &Path) -> std::io::Result<[u8; 32]> {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes
+            .try_into()
+            .map_err(|_| std::io::Error::other("assertion key file has the wrong size")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let seed = edge_assert::Signer::generate_seed()
+                .map_err(|_| std::io::Error::other("random source unavailable"))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path)?;
+            file.write_all(&seed)?;
+            file.sync_all()?;
+            Ok(seed)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn run_deny_all() {
+    // The isolated container listener; tests use serve() on loopback instead.
+    let listener = match TcpListener::bind(DEFAULT_BIND).await {
+        Ok(listener) => listener,
+        Err(_) => fail("listener unavailable"),
+    };
+    eprintln!("mcp-edge: deny-all; forwarding disabled");
+    let stopping = CancellationToken::new();
+    let signal = stopping.clone();
+    tokio::spawn(async move {
+        stopped().await;
+        signal.cancel();
+    });
+    if mcp_edge::deny_all::serve(listener, stopping).await.is_err() {
+        fail("listener stopped with error");
+    }
+}
+
+async fn run_edge() {
+    let cfg = match EdgeConfig::from_env(|k| std::env::var(k).ok(), |p| std::fs::read_to_string(p))
+    {
+        Ok(cfg) => cfg,
+        Err(e) => fail(&e.to_string()),
+    };
+    let seed = match load_or_create_seed(&cfg.data_dir.join("assertion-key.bin")) {
+        Ok(seed) => seed,
+        Err(_) => fail("assertion key unavailable (check EDGE_DATA_DIR permissions)"),
+    };
+    let origin = match url::Url::parse(&cfg.public_url) {
+        Ok(u) => u,
+        Err(_) => fail("EDGE_PUBLIC_URL"),
+    };
+    let proof = match WebauthnOwnerProof::new(&cfg.rp_id, &origin, &cfg.rp_name) {
+        Ok(p) => p,
+        Err(_) => fail("WebAuthn relying-party configuration rejected"),
+    };
+    let backend_ids: Vec<String> = cfg.routes.iter().map(|r| r.id.clone()).collect();
+    let built = app::build(
+        AppConfig {
+            issuer: cfg.public_url.clone(),
+            routes: cfg.routes,
+            redirect_allowlist: cfg.redirect_allowlist,
+            enroll_code: cfg.enroll_code,
+            trust_forwarded_for: cfg.trust_forwarded_for,
+            auth_limits: Limits::default(),
+            edge_limits: EdgeLimits::default(),
+        },
+        AppDeps {
+            db_path: Some(cfg.data_dir.join("edge.db")),
+            proof: Arc::new(proof),
+            clock: Arc::new(SystemClock),
+            log: Arc::new(StderrLog),
+            signing_seed: seed,
+        },
+    );
+    let built = match built {
+        Ok(b) => b,
+        Err(e) => fail(&e.to_string()),
+    };
+    let listener = match TcpListener::bind(cfg.bind).await {
+        Ok(listener) => listener,
+        Err(_) => fail("listener unavailable"),
+    };
+    eprintln!(
+        "mcp-edge: edge mode issuer={} backends={} assertion_key={}",
+        cfg.public_url,
+        backend_ids.join(","),
+        built.assertion_public_key
+    );
+    let stopping = CancellationToken::new();
+    let signal = stopping.clone();
+    tokio::spawn(async move {
+        stopped().await;
+        signal.cancel();
+    });
+    let auth = built.auth.clone();
+    let janitor = stopping.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = janitor.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => auth.cleanup(),
+            }
+        }
+    });
+    if mcp_edge::server::serve(listener, built.router, stopping)
+        .await
+        .is_err()
+    {
+        fail("listener stopped with error");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -55,34 +195,12 @@ async fn main() {
         }
         return;
     }
-    if !args.is_empty()
-        || wiskit_gateway_inert::validate_mode(std::env::var("WISKIT_GATEWAY_MODE").ok().as_deref())
-            .is_err()
-    {
-        eprintln!("gateway: refused unsupported configuration");
-        std::process::exit(1);
+    if !args.is_empty() {
+        fail("refused unsupported arguments");
     }
-    // This bind is for the isolated container network. Native tests use serve()
-    // with an OS-assigned 127.0.0.1 listener and never launch this main process.
-    let listener = match TcpListener::bind("0.0.0.0:8080").await {
-        Ok(listener) => listener,
-        Err(_) => {
-            eprintln!("gateway: listener unavailable");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("gateway: deny-all; forwarding disabled");
-    let stopping = CancellationToken::new();
-    let signal = stopping.clone();
-    tokio::spawn(async move {
-        stopped().await;
-        signal.cancel();
-    });
-    if wiskit_gateway_inert::serve(listener, stopping)
-        .await
-        .is_err()
-    {
-        eprintln!("gateway: listener stopped with error");
-        std::process::exit(1);
+    match Mode::parse(std::env::var("EDGE_MODE").ok().as_deref()) {
+        Ok(Mode::DenyAll) => run_deny_all().await,
+        Ok(Mode::Edge) => run_edge().await,
+        Err(_) => fail("refused unsupported configuration"),
     }
 }

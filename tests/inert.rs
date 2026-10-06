@@ -1,3 +1,7 @@
+use mcp_edge::{
+    deny_all::{serve, CONNECTION_DEADLINE, MAX_CONNECTIONS},
+    Mode,
+};
 use std::{net::SocketAddr, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -6,7 +10,6 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use wiskit_gateway_inert::{serve, validate_mode, CONNECTION_DEADLINE, MAX_CONNECTIONS};
 
 struct Fixture {
     addr: SocketAddr,
@@ -114,7 +117,16 @@ async fn absolute_destinations_connect_duplicate_hosts_and_oversize_headers_are_
         "a".repeat(32 * 1024)
     );
     let output = f.raw(huge.as_bytes()).await;
-    assert!(output.starts_with(b"HTTP/1.1 431 ") || output.starts_with(b"HTTP/1.1 400 "));
+    // The server stops reading at its buffer limit and closes. Depending on
+    // timing (notably on Windows) the client sees the 431/400 or a reset that
+    // discards it; it must never see the request served.
+    assert!(
+        output.starts_with(b"HTTP/1.1 431 ")
+            || output.starts_with(b"HTTP/1.1 400 ")
+            || output.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&output[..output.len().min(80)])
+    );
     f.finish().await;
 }
 
@@ -186,10 +198,11 @@ async fn connection_capacity_is_bounded_and_capacity_returns_on_shutdown() {
 }
 
 #[test]
-fn configuration_cannot_enable_forwarding() {
-    assert!(validate_mode(None).is_ok());
-    assert!(validate_mode(Some("deny-all")).is_ok());
-    for value in ["forward", "mock", "production", "", "true"] {
-        assert!(validate_mode(Some(value)).is_err());
+fn mode_defaults_to_deny_all_and_only_known_modes_parse() {
+    assert_eq!(Mode::parse(None).unwrap(), Mode::DenyAll);
+    assert_eq!(Mode::parse(Some("deny-all")).unwrap(), Mode::DenyAll);
+    assert_eq!(Mode::parse(Some("edge")).unwrap(), Mode::Edge);
+    for value in ["forward", "mock", "production", "", "true", "EDGE", "proxy"] {
+        assert!(Mode::parse(Some(value)).is_err());
     }
 }
