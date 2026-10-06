@@ -335,3 +335,267 @@ The edge parses the body only to echo the JSON-RPC `id`; it never logs it.
 
 The Coolify container needs outbound UDP (QUIC to relay and for hole punching) and
 HTTPS to n0 DNS. No inbound UDP port is published.
+
+## 3. Origin consent (`consent = "origin"`)
+
+### 3.1 End to end
+
+```text
+Claude            browser / edge                          edge → origin tunnel        Wiskit app (owner)
+  │ /authorize ──▶ pending tx (browser-bound cookie)
+  │                passkey proof (as phase 2)
+  │                consent page: client, backend, warnings
+  │                [Continue to Wiskit]  (CSRF, fresh proof)
+  │                pairing code K7Q-M2X shown ───────────── consent_request ───────▶ "Claude wants access"
+  │                page polls /consent/status (2 s)                                   type code K7Q-M2X
+  │                                                                                   pick trackers (read)
+  │                                                                                   pick lifetime ≤ 24 h
+  │                                                  ◀──── signed approval ──────── [Approve] / [Deny]
+  │                verify approval, create grant with
+  │                resource_scope, issue one-use code
+  │ ◀── 303 redirect_uri?code&state&iss
+  │ /token (PKCE) ─▶ access + refresh (phase 2 rules)
+```
+
+### 3.2 Edge pending-request state machine
+
+Extends the phase 2 `pending` row (10 min TTL, browser-bound, one-shot).
+
+| State | Entered when | Page shows | Leaves to |
+|---|---|---|---|
+| `created` | `/authorize` accepted | passkey prompt | `proved`, `expired` |
+| `proved` | passkey verified (≤ 5 min old) | client/backend details, data-export warning, **Continue to Wiskit** | `sent`, `denied` (owner clicks Deny here), `expired` |
+| `sent` | Continue POST (CSRF + proof still fresh) and the tunnel accepted `consent_request` | pairing code, "Approve in Wiskit on your PC", Cancel | `approved`, `denied`, `origin_timeout`, `origin_unreachable`, `cancelled` |
+| `origin_unreachable` | dial/stream failed or `consent_busy` | reason + **Try again** (≤ 3 attempts per tx, new pairing code each time) | `sent`, `denied`, `expired` |
+| `approved` | valid approval verified (§3.5) | "Approved, returning to Claude" | `code_issued` |
+| `code_issued` | grant + code created atomically | 303 to `redirect_uri` with `code`, `state`, `iss` | terminal |
+| `denied` | owner denied in app or on edge page | 303 with `error=access_denied` | terminal |
+| `origin_timeout` | no decision within 180 s | "No decision in Wiskit" + button that redirects `access_denied` | terminal |
+| `cancelled` | owner clicked Cancel | edge stops the stream (origin drops the prompt); redirect `access_denied` | terminal |
+| `expired` | pending TTL passed | phase 2 error page | terminal |
+
+Status endpoint: `GET /consent/status?tx=…` (same `__Host-` browser binding as the
+consent page; JSON `{"state": "...", "attempts_left": n}`; no codes, no tracker names).
+The page's existing `edge.js` polls it every 2 s; without JS a **Check** button reloads.
+The final redirect is issued by a CSRF-protected `POST /consent/finish` so the code never
+appears in a JSON response.
+
+### 3.3 `consent_request` fields (edge → origin)
+
+Data minimization: the app gets what the owner needs to recognize the request, nothing
+from the browser (no IP, user agent, cookie).
+
+| Field | Type / bound | Shown in app |
+|---|---|---|
+| `tx` | random id ≤ 32 | no (bound into the approval) |
+| `grant_id` | `g_` + random, ≤ 40 | no (becomes the shared grant id) |
+| `nonce` | 32 random bytes b64url | no (must be echoed in the approval) |
+| `pairing_code` | 6 Crockford base32 chars | **no**; the owner must type it (D3) |
+| `client_id` | ≤ 64 | yes (small) |
+| `client_name` | ≤ 80, control chars stripped, labelled "self-reported" | yes |
+| `client_registered_at` | unix s | yes ("registered 3 min ago") |
+| `redirect_host` | host only | yes (`claude.ai`) |
+| `requested_at` | unix s | yes |
+| `scopes` | ⊆ route scopes | yes (as "read-only") |
+| `max_lifetime_secs` | route `grant_lifetime_secs` | caps the app's lifetime choices |
+| `expires_at` | ≤ `requested_at` + 180 | countdown |
+
+### 3.4 App side
+
+| Step | Rule |
+|---|---|
+| Preconditions | Remote mode on, enrollment valid, identity unlocked, desktop build. Otherwise the origin answers `remote_disabled` / `enrollment_stale` / `origin_locked` immediately |
+| Prompt | A modal in the main window plus an OS notification ("Claude is asking for read access to Wiskit"). One pending prompt at a time |
+| Code | Owner types the 6-char code from the browser; compared in constant time; 3 wrong entries deny the request |
+| Trackers | Checklist of grantable trackers, **none preselected**. Grantable = trackers whose owner is this identity (handoff item 4: a reader of a shared tracker is not automatically allowed to export it; D4). Archived trackers listed separately. 1..=32 selectable |
+| Access | Read-only; no other choice exists in v1 |
+| Lifetime | 1 h, 8 h, or `max_lifetime_secs` (24 h trial), whichever ≤ max; default 1 h |
+| Export notice | Fixed text: the edge operator (the owner's own server) and Anthropic will see the returned tracker data in plaintext |
+| Decision | Approve / Deny. Closing the modal = Deny. Timeout at `expires_at` = no response, stream closed |
+| Record | On approve the app writes its grant record (§4.2) **before** sending the approval, and drops it if the send fails |
+
+### 3.5 Signed approval
+
+Signing key: the Wiskit transport secret key (`secret.key`, Ed25519), with domain
+separation. Rationale: the edge already pins this key as the origin's EndpointId, so no
+new key needs storage, backup or enrollment; a transport-key change already forces
+re-enrollment and fresh consent; family keys (DEKs, HALO identity, Stronghold) stay
+entirely out of remote access. Alternative keys are D2.
+
+Wire form (mirrors `edge-assert`):
+
+```text
+<base64url-nopad(canonical JSON claims)>.<base64url-nopad(Ed25519 signature)>
+signature over ASCII "mcp-edge-approval.v1." || payload segment as transmitted
+```
+
+| Claim | Type | Rule at the edge |
+|---|---|---|
+| `v` | 1 | — |
+| `decision` | `"approve"` \| `"deny"` | — |
+| `iss` | 64 hex | = configured origin EndpointId, and = the verifying key |
+| `edge_id` | 64 hex | = this edge's iroh EndpointId |
+| `aud` | URL | = edge issuer |
+| `backend` | id | = route id |
+| `tx`, `grant_id`, `nonce`, `client_id` | strings | = the values sent in `consent_request` |
+| `resource_scope` | object (approve only) | `{"v":1,"access":"read","trackers":[...]}`; trackers sorted, unique, 1..=32, each matches `^[A-Za-z0-9_-]{1,64}$`; serialized ≤ 3 KiB |
+| `lifetime_secs` | int (approve only) | 300 ≤ x ≤ route `grant_lifetime_secs` |
+| `iat`, `exp` | unix s | `0 < exp - iat ≤ 120`; 5 s skew; `exp` not passed |
+
+Canonical JSON and strict verification exactly as `edge-assert` (sorted keys, integers
+only, unknown claims rejected). A valid `deny` moves the tx to `denied`; an invalid
+approval of either kind is logged (`event=origin_approval_invalid`) and treated as
+`origin_unreachable`, never as approval.
+
+On approve the edge, in one transaction: consumes the pending row; creates the grant
+with the given `grant_id`, `resource_scope`, `expires = now + lifetime_secs`, `gen = 1`;
+stores the approval string on the grant row (evidence); creates the one-use code.
+`create_grant_with_code` gains `resource_scope` and `expires` parameters (it currently
+hard-codes `'{}'` and the route lifetime).
+
+### 3.6 Revocation and `gen`
+
+| Initiator | Edge | Origin |
+|---|---|---|
+| Owner in edge `/owner` (revoke / revoke all), RFC 7009 `/revoke`, refresh replay, expiry | Grant `revoked`, gen++ (phase 2 behaviour); best-effort `grant_revoke` to origin | Record → tombstone `revoked` until its expiry; in-flight work of the grant cancelled |
+| Owner in app (per-grant Revoke, "Revoke all remote", remote mode off, re-enroll, app restart in trial) | Learns on the next request (`grant_revoked`/`unknown_grant` → revoke + 401) or at `grant_sync` on reconnect | Immediate: refuses the next request regardless of edge state |
+| Edge offline from origin when it revokes | Grant already unusable (no assertion minted for revoked grants) | Cleaned at next `grant_sync`; record expires anyway |
+
+`gen` rule: the origin stores the `gen` from the first assertion it sees for a grant
+(always 1 today) and requires equality on every request. The edge changes `gen` only on
+revocation, and a revoked grant never mints assertions, so a mismatch means a bug or
+tamper: `assertion_invalid`, logged on both sides. Any future "narrow this grant"
+feature must go through a new signed approval, not a `gen` bump.
+
+`grant_sync` runs on every new edge→origin connection: the edge sends its active
+grants for the route (≤ 64), revokes those the origin reports `revoked` or `unknown`.
+
+## 4. Origin enforcement
+
+### 4.1 Request pipeline (all inside `edge-origin` + Wiskit; fail closed at each step)
+
+| # | Check | Failure |
+|---|---|---|
+| 1 | Peer = enrolled `edge_id` | close 1 |
+| 2 | Enrollment not stale; remote mode on | close 5 / close 3 (or `remote_disabled` per stream if it changed mid-connection) |
+| 3 | Framing, caps, meta schema, `path`, `v`, no trailing bytes | `bad_request` |
+| 4 | Verify `Edge-Assertion` with the enrolled key: signature; `iss` = enrolled issuer; `aud` = enrolled backend; `0 < exp-iat ≤ 60`, 5 s skew; `req` = SHA-256 of `POST\n/mcp\n<body>`; `jti` unseen (replay cache 10 000 entries, full → reject); `sub` = enrolled `sub`; `scope` = enrolled scopes; `iat` ≥ origin process start − 5 s | `assertion_invalid` |
+| 5 | Grant record for `grant_id`: exists, `active`, not expired, `client_id` equal, `gen` equal | `unknown_grant` / `grant_revoked` / `grant_expired` / `assertion_invalid` |
+| 6 | `resource_scope.access == "read"` and assertion trackers ⊆ record trackers | `scope_mismatch` (also revokes the record) |
+| 7 | Audit write for the request succeeds (§4.5) | `audit_unavailable`; remote mode → `paused` |
+| 8 | Build `RemoteGrantContext` **from the record**, never from the assertion or request | — |
+| 9 | Concurrency slot (global 4, per grant 2) | `busy` |
+| 10 | Remote MCP adapter → broker → bridge (§4.3) | MCP-level errors |
+| 11 | Before emitting the response: grant still active with the same `gen`, remote still on | `grant_revoked` / `remote_disabled`; the result is discarded |
+
+### 4.2 `RemoteGrantContext` and the grant record
+
+```rust
+pub struct RemoteGrantContext {        // immutable; constructed only by the origin grant store
+    pub grant_id: GrantId,             // shared with the edge, non-secret
+    pub client_id: String,
+    pub client_label: String,          // self-reported name at consent, for audit display only
+    pub trackers: BTreeSet<TrackerId>, // explicit, owner-approved
+    pub access: RemoteAccess,          // only RemoteAccess::Read exists in v1
+    pub expires_at: u64,
+    pub gen: u64,
+    pub epoch: u64,                    // bumps on remote off / re-enroll / revoke-all
+}
+```
+
+| Record field | Source |
+|---|---|
+| `grant_id`, `client_id`, `client_label`, `trackers`, `expires_at` | the owner's approval |
+| `gen` | first verified assertion (then fixed) |
+| `state` | `active` → `revoked` (tombstone) → deleted at `expires_at` |
+| `epoch` | current remote epoch at approval; a record from an older epoch is `unknown` |
+| `created_at`, `last_used_at` | local clock |
+
+Storage in the trial: memory only (`RemoteGrantStore` in managed Tauri state). Restart
+= all remote grants gone and remote mode off (handoff default). Persistent records are
+D1. Limits: ≤ 16 active remote grants.
+
+### 4.3 Broker and bridge changes
+
+| Item | Change |
+|---|---|
+| Entry point | New `broker::handle_remote(state, &RemoteGrantContext, method, params, cancel)`; the loopback path (`handle_request`) is unchanged. Remote calls do **not** require the loopback listener (`is_live()`) and local capability tokens are never valid remotely |
+| Method allowlist | Exactly `wiskit_list_trackers`, `wiskit_read_tracker_bundle`. Everything else (documents, decks, search, read_document, writes, session_status) → JSON-RPC `METHOD_NOT_FOUND` before the bridge |
+| Pre-check | `wiskit_read_tracker_bundle`: `trackerId` ∈ `ctx.trackers` **before** emitting to the WebView; otherwise tool error `tracker_not_granted` (same message whether the tracker exists or not) |
+| Bridge payload | `BridgeRequestPayload` gains `remote: Option<RemoteBridgeScope { grantId, trackerIds, epoch }>`; nonce rules unchanged; `mcp_bridge_authorize` additionally checks the remote scope it registered |
+| WebView projection | `dispatchBridgeRequest` gets a remote mode: list filtered to `trackerIds`; bundle uses the remote projection (§4.4). Pure function, unit-tested |
+| Rust post-check (authoritative) | The broker re-validates the JSON the WebView returned before emitting: list → every `id` ∈ ctx; bundle → `tracker.id` == requested and every event's `trackerId` == requested; only allowlisted keys present (§4.4); serialized size ≤ 1 MiB. Any violation → result dropped, `BRIDGE_ERROR`, audited as `leak_blocked` |
+| Bridge availability | The agent-bridge listener (`installAgentBridge`) today exists only while local agent access is on; it must also be installed while remote mode is on |
+| Cancellation | Bridge requests are registered with their `grant_id`; `cancel_grant(id)`, `cancel_remote_all()` added next to `cancel_all()` |
+
+### 4.4 Remote tool surface (v1)
+
+| Tool | Input | Output (allowlisted keys only) |
+|---|---|---|
+| `wiskit_list_trackers` | `{}` | `{trackers: [{id, name, description, icon, interval, unit, detailsSchema, archived, createdAt, updatedAt}]}`, granted trackers only |
+| `wiskit_read_tracker_bundle` | `{trackerId: string, limit?: 1..=500 (default 200), before?: cursor}` | `{tracker: {…same keys…}, events: [{id, timestamp, details}], nextCursor: string \| null}` newest first |
+
+Removed from the local projection for remote use: `owner` (identity ids), `deckId`
+(reveals deck membership of other trackers), `accessState`, event `owner`, event
+`attachmentIds`, and `details` fields whose schema type is an attachment/photo. Photos do
+not leave the device in v1.
+
+Pagination replaces truncation: the cursor is opaque (`b64url(timestamp:eventId)`),
+bound to the tracker; a result that would still exceed 1 MiB returns tool error
+`result_too_large` asking for a smaller `limit`. A ~10 000-event tracker is about 50
+pages at the default.
+
+MCP adapter (Rust, stateless JSON, mirrors the edge's echo backend): `initialize`
+(negotiates `2025-11-25`/`2025-06-18`/`2025-03-26`, default `2025-06-18`, no session id),
+`notifications/initialized` (202), `ping`, `tools/list` (two tools, `readOnlyHint: true`
+as advisory annotation), `tools/call`, `notifications/cancelled` (202). Batches are
+rejected. Tool results: `content: [{type: "text", text: <JSON>}]` plus `structuredContent`
+for ≥ 2025-06-18.
+
+### 4.5 Durable redacted audit
+
+New append-only table in `wiskit.db`, separate from `mcp_audit` (whose summaries can
+contain family text):
+
+| Column | Content |
+|---|---|
+| `seq`, `ts` | — |
+| `grant_id` | non-secret shared id |
+| `client_label` | self-reported, ≤ 80 |
+| `op` | `consent_prompt`, `consent_approve`, `consent_deny`, `initialize`, `tools_list`, `list_trackers`, `read_bundle`, `cancel`, `revoke`, `remote_on`, `remote_off`, `enroll`, `refused` |
+| `decision` | `ok`, `denied`, `error`, `leak_blocked` |
+| `reason` | error enum from §2.7 / tool error code |
+| `tracker_id` | local id (names resolved only at display, locally) |
+| `count` | events or trackers returned |
+| `bytes` | response size |
+
+Never stored: assertions, tokens, codes, pairing codes, nonces, JSON-RPC params beyond
+`trackerId`, cursors, event content, names typed by Claude.
+
+| Rule | Behaviour |
+|---|---|
+| Ordering | Request audited before the bridge call; outcome row before the response is emitted |
+| Failure | Any insert failure → remote mode `paused`, in-flight remote work cancelled, every request `audit_unavailable` until the owner resumes in Settings (which retries an insert first) |
+| No in-memory fallback | Unlike `mcp_audit`, remote audit never degrades to memory-only |
+| Retention | 5 000 rows, as `mcp_audit` |
+| UI | Agent Activity shows remote entries with a "Remote (mcp-edge)" badge |
+
+### 4.6 Remote mode switch
+
+| Property | Value |
+|---|---|
+| Location | Settings → Agent access → Remote access (mcp-edge), desktop only (hidden on iOS/Android) |
+| Default | Off. In the trial it also returns to off on every app start (preference not persisted; D1) |
+| Independence | Separate from the local agent-access switch (default on for desktop); neither implies or disables the other. A separate "Stop all agent access" button turns both off |
+| On requires | Valid, non-stale enrollment; unlocked identity; audit table writable |
+| Off does | Epoch++; all remote grant records dropped; pending consent prompt closed; remote bridge requests cancelled; origin answers `remote_disabled` (existing connections closed with code 3) |
+| States | `off`, `on`, `paused` (audit failure), `stale` (enrollment) |
+
+### 4.7 Restart behaviour
+
+| Event | Origin | Edge |
+|---|---|---|
+| App restart (trial) | Grants gone, remote off, replay cache empty, assertions with `iat` before start refused | Next request: `remote_disabled` (503). After owner turns remote on: `unknown_grant` → grant revoked → Claude must reconnect (new consent) |
+| PC sleep/wake | Grants kept (memory), endpoint reconnects | Requests during sleep fast-fail `origin_offline`; recover without consent |
+| Edge restart | — | Grants in SQLite survive; first connection runs `grant_sync` |
+| Wiskit identity locked | `origin_locked` for MCP and consent | 503 |
