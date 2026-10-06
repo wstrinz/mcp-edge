@@ -170,6 +170,7 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
                 EchoBackend::new(&public_key, &cfg.issuer, &route.id)
                     .map_err(|_| InitError::Config("assertion key"))?,
             ),
+            RouteKind::Http => return Err(InitError::Config("http backends are not wired yet")),
         };
         backends.insert(
             route.id.clone(),
