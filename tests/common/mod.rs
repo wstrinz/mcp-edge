@@ -56,6 +56,8 @@ pub struct Options {
     pub auth_limits: Limits,
     pub edge_limits: EdgeLimits,
     pub enroll_code: Option<String>,
+    /// Route table (TOML); defaults to [`ROUTES`].
+    pub routes: String,
 }
 
 impl Default for Options {
@@ -71,6 +73,7 @@ impl Default for Options {
             },
             edge_limits: EdgeLimits::default(),
             enroll_code: Some(ENROLL_CODE.into()),
+            routes: ROUTES.to_string(),
         }
     }
 }
@@ -202,7 +205,7 @@ impl Harness {
         let built = app::build(
             AppConfig {
                 issuer: ISSUER.into(),
-                routes: parse_routes(ROUTES).unwrap(),
+                routes: parse_routes(&opts.routes).unwrap(),
                 redirect_allowlist: vec![CALLBACK.into(), OTHER_CALLBACK.into()],
                 enroll_code: opts.enroll_code,
                 trusted_proxies: parse_cidrs("127.0.0.0/8").unwrap(),

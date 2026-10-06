@@ -745,6 +745,12 @@ display_name = "Echo"
         ] {
             assert!(validate_upstream_url(ok).is_ok(), "{ok}");
         }
+        // The planned hevy route: the signed path is exactly `/mcp`, and
+        // `/mcp/` stays a different (also exact) upstream path.
+        let hevy = validate_upstream_url("https://hevy-mcp.app.stri.nz/mcp").unwrap();
+        assert_eq!(hevy.path(), "/mcp");
+        let slash = validate_upstream_url("https://hevy-mcp.app.stri.nz/mcp/").unwrap();
+        assert_eq!(slash.path(), "/mcp/");
         for bad in [
             "http://mcp.example.com/mcp", // public name over plain http
             "http://hevy.internal/mcp",   // multi-label name over plain http
