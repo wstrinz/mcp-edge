@@ -722,3 +722,41 @@ Never stored: assertions, tokens, codes, pairing codes, nonces, JSON-RPC params 
 | D13 | Remote mode on iPhone | **Never in phase 4** (compiled out; iOS cannot keep the endpoint up anyway) |
 | D14 | Offline response shape | **HTTP 503 + JSON-RPC error body + `Retry-After`**; switch to a 200 tool error only if 4D shows Claude handles 503 badly |
 | D15 | One shared "Stop all agent access" control in addition to the two independent switches | **Yes** |
+
+## 9. Phase 4 crate notes (`edge-tunnel`, `edge-origin`)
+
+Built on branch `phase4-crates` (phase 4A, crates only; the gateway forwarder,
+`edge-auth` consent flow and Wiskit integration are separate work). Formats:
+[crates/edge-tunnel/README.md](../crates/edge-tunnel/README.md); origin API:
+[crates/edge-origin/README.md](../crates/edge-origin/README.md). Where this
+spec was silent or ambiguous, the conservative reading below was implemented.
+
+| # | Topic | Resolution |
+|---|---|---|
+| N1 | Where approval and enrollment code lives | §5 puts approval sign/verify in `edge-tunnel`; it is there (both sides need it and neither side should depend on the other's crate), with the enrollment parse/format/fingerprint. `edge-origin` re-exports both and signs through `ConsentResponder`. |
+| N2 | Control-op responses vs the 2 KiB response-meta cap | The 2 KiB cap is for `mcp_post`. A control op's whole answer is its metadata object, capped at the op's response cap (4 / 16 / 1 / 1 KiB), followed directly by the terminator and FIN; any chunk is a protocol error. |
+| N3 | Shape of refusals | `error` requires `status == error.status()` (§2.7 column) and, for `mcp_post`, `content_type: application/json`; no chunks follow. Unparseable metadata or an unknown `op` is answered in the `mcp_post` shape. |
+| N4 | Truncation | Missing terminator, FIN inside a field, or a stream reset, before or after the response metadata, are all `Truncated` (edge: 502 `backend_protocol`). The origin aborts by stream reset (code 1); a reset may overtake metadata already written, hence "before or after". |
+| N5 | Over-cap / invalid app output at the origin | The origin never sends a partial success: a `Full` body over 1 MiB, an over-cap stream, an invalid status, a 5 s write stall or an app stream error resets the stream. The edge enforces every cap independently. |
+| N6 | Order of §4.1 steps 5–9 | The origin's rate limit (120 per grant per minute, fixed 60 s windows keyed by the verified `grant_id`) and concurrency slots (4 global, 2 per grant) are taken before the app is called; steps 5–8, 10, 11 run inside `OriginApp::mcp_post`. Only the reported code differs when both a slot and a grant check would fail. |
+| N7 | `ping` while remote is off / stale | The connection is closed with 3 / 5 at accept (§4.1 step 2), so the edge learns `origin_remote_off` / `origin_unenrolled` from the close code; `ping` reports `off` / `stale` only if the state changed on a live connection. `paused` admits the connection (`ping` says `paused`; `mcp_post` and `consent_request` get `audit_unavailable`). `ping` has no trait method: the handler answers from `remote_state()`, the enrollment fingerprint and `origin_version()`. |
+| N8 | Offline window vs close codes | Only a failed or > 3 s dial starts the 15 s offline window. A connection the origin closed with a code is reported as that code and redialled on the next request. The `connection_limit` re-dial re-sends the request once on the new connection (nothing was processed on the refused one). |
+| N9 | `grant_sync` answer | The origin answers exactly the grants asked about: omitted by the app → `unknown` (fails closed: the edge revokes), extras dropped. The edge client rejects an answer whose set differs from what it sent. |
+| N10 | Consent timing and delivery | The origin refuses `expires_at` in the past or more than 180 s + 5 s ahead (`bad_request`) and cancels the prompt at `expires_at`. "Send succeeded" (§3.4, Record) means the edge acknowledged every byte after FIN within 5 s; otherwise `approve` returns `Err` and the app drops its record. Signed approvals are valid 60 s. The single consent slot is held until the app's handler returns. |
+| N11 | Pairing code entry | `pairing_code_matches` is constant time, case-insensitive, accepts Crockford aliases (`O`→`0`, `I`/`L`→`1`) and ignores spaces and `-`. Counting wrong entries stays in the app. |
+| N12 | Field bounds the spec left open | `tx` `[A-Za-z0-9_-]{1,32}`; `grant_id` `g_[A-Za-z0-9_-]{1,38}`; `client_id` ≤ 64 bytes and `client_name` ≤ 80 chars, both without control characters; `redirect_host` `[A-Za-z0-9.-]`, ≤ 253; scopes use the route-table scope charset; `max_lifetime_secs` 300..=30 days on the wire (the route value is the real cap); `origin_version` ≤ 64; enrollment `aud` follows the backend-id rule and `iss` must be `https://` without query, fragment, userinfo or backslash; the fingerprint's four groups are joined with `-`. |
+| N13 | "Origin process start" for the `iat` rule | `OriginConfig::started_at_unix`, default = handler creation; the app creates the handler at start. |
+| N14 | Stream caps on a shared endpoint | Wiskit's endpoint keeps its own QUIC settings (§2.2 MTU row), so the origin enforces 8 streams per connection in software (extra streams are reset). `edge_tunnel::transport_config()` carries the §2.2 values for the edge's endpoint. |
+| N15 | Edge per-grant limit | `McpPostRequest.grant_id` is local only; the origin reads the grant from the signed assertion. |
+| N16 | Lockfile and D8 | iroh `=1.3.0` with `default-features = false, features = ["tls-ring"]` (as the PoC; Wiskit's default features unify with it). Every transitive package iroh added was pinned with `cargo update --precise` to the version in Wiskit's `Cargo.lock` at `c53f804`; no package locked before (phase 3: rustls 0.23.45, ring 0.17.14, reqwest 0.12.28, ...) changed version. iroh-relay brings reqwest 0.13.4 alongside the edge's 0.12.28. Every direct pin of the three crates (tokio 1.50.0, tokio-util 0.7.17, bytes 1.11.0, serde 1.0.228, serde_json 1.0.145, futures-util 0.3.31, base64 0.22.1, sha2 0.10.9, ed25519-dalek 2.2.0, getrandom 0.3.4) already resolves in Wiskit's lock. |
+
+Open points for the gateway and Wiskit work:
+
+* The edge client does not run `grant_sync` itself; the gateway subscribes to
+  `OriginClient::subscribe_connections()` and runs it on each new connection.
+* A consent stream that ends without an answer (prompt closed, origin restart)
+  surfaces as `Truncated`; per §3.2 the gateway treats any `TunnelError` on
+  `consent_request` as `origin_unreachable`, and no decision by 180 s as
+  `origin_timeout`.
+* `VerifiedGrant.resource_scope` is the edge-signed copy; Wiskit must still
+  authorize from its own record (§4.2) and use the assertion only for identity.

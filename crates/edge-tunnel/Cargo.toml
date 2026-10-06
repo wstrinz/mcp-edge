@@ -1,0 +1,24 @@
+[package]
+name = "edge-tunnel"
+version = "0.1.0"
+description = "Wire protocol (ALPN mcp-edge/1) and edge-side client for mcp-edge iroh backends"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+edge-assert = { path = "../edge-assert" }
+base64 = "=0.22.1"
+bytes = "=1.11.0"
+futures-util = { version = "=0.3.31", default-features = false }
+getrandom = "=0.3.4"
+# Pinned to the exact iroh Wiskit resolves (PHASE4.md D8), so an app embedding
+# edge-origin links one iroh. tls-ring matches the PoC and Wiskit's default.
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+sha2 = "=0.10.9"
+tokio = { version = "=1.50.0", features = ["io-util", "sync", "time", "macros", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "=1.50.0", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
