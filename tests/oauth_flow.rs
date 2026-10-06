@@ -85,6 +85,13 @@ async fn run_full_flow(h: &mut Harness) -> Secrets {
         "client name is escaped"
     );
     assert!(html.contains("30 days"));
+    // Anti-phishing copy: the instruction, request age, client registration
+    // time, and the client name labelled as self-reported.
+    assert!(html.contains("Approve only if you just clicked Connect in Claude yourself."));
+    assert!(html.contains("<dt>Requested</dt><dd>0 seconds ago</dd>"));
+    assert!(html.contains("<dt>Client registered</dt>"));
+    assert!(html.contains("UTC (0 seconds ago)"));
+    assert!(html.contains("name self-reported by the client"));
     assert!(
         extract_csrf(&html).is_none(),
         "no consent form before passkey proof"

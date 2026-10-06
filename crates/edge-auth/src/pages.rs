@@ -11,6 +11,10 @@ pub(crate) struct ConsentView<'a> {
     pub resource: &'a str,
     pub scopes: &'a str,
     pub grant_lifetime: String,
+    /// How long ago the authorization request was made.
+    pub requested_ago: String,
+    /// When the client registered (absolute and relative).
+    pub client_registered: String,
     pub issuer_host: &'a str,
     /// `Some(csrf)` once the owner has proved presence with a passkey.
     pub csrf: Option<&'a str>,
@@ -44,16 +48,24 @@ pub(crate) fn message(title: &str, text: &str) -> String {
 pub(crate) fn consent(v: &ConsentView<'_>) -> String {
     let client = match v.client_name {
         Some(name) if !name.is_empty() => format!(
-            "<strong>{}</strong> <span class=\"muted\">({})</span>",
+            "<strong>{}</strong> <span class=\"muted\">(name self-reported by the client; \
+id {})</span>",
             e(name),
             e(v.client_id)
         ),
-        _ => format!("<strong>{}</strong>", e(v.client_id)),
+        _ => format!(
+            "<strong>{}</strong> <span class=\"muted\">(no name given)</span>",
+            e(v.client_id)
+        ),
     };
     let details = format!(
         "<h1>Authorize access</h1>\
+<p class=\"warning\"><strong>Approve only if you just clicked Connect in Claude yourself.</strong> \
+If you did not start this, deny it: someone may be trying to get access through your account.</p>\
 <dl>\
+<dt>Requested</dt><dd>{}</dd>\
 <dt>Client</dt><dd>{client}</dd>\
+<dt>Client registered</dt><dd>{}</dd>\
 <dt>Returns to</dt><dd>{}</dd>\
 <dt>Backend</dt><dd><strong>{}</strong><br><code>{}</code></dd>\
 <dt>Scopes</dt><dd><code>{}</code></dd>\
@@ -63,6 +75,8 @@ the grant ends after {} unless you revoke it sooner.</dd>\
 <p class=\"note\">Requests and results pass through this edge ({}), which terminates TLS \
 and can therefore see them. You can revoke this grant at any time from \
 <a href=\"/owner\">/owner</a>.</p>",
+        e(&v.requested_ago),
+        e(&v.client_registered),
         e(v.redirect_host),
         e(v.backend_name),
         e(v.resource),

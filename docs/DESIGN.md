@@ -165,6 +165,10 @@ below was taken.
   request* from that browser, and its result must be under 5 minutes old when the
   CSRF-protected consent form is submitted. An owner session (from `/owner`) never
   approves consent by itself. Pending requests live 10 minutes and are one-shot.
+- Consent phishing: anyone can register a client and send the owner an authorization
+  link. The consent page leads with "Approve only if you just clicked Connect in Claude
+  yourself", shows how long ago the request was made and when the client registered,
+  and labels the client name as self-reported.
 - Errors before the client and exact redirect URI are verified render a 400 page and
   never redirect. Later errors redirect with `error` and `iss` (and `state` if valid).
 - Browser POSTs with an `Origin` other than the issuer are refused; JSON endpoints
@@ -237,6 +241,9 @@ below was taken.
   existing file of the wrong size stops startup instead of being replaced. Rotation is manual
   (delete the file, update backends). Backends get the key from
   `/.well-known/edge-assertion-key` or the startup log, configured out of band.
+- For phase 3 (noted as a TODO at the dispatch point in `src/app.rs`): the HTTP
+  forwarder must build upstream requests from scratch, strip any client-supplied
+  `Edge-Assertion` header, and sign exactly the path and body it forwards.
 
 **Transport and limits**
 - MCP is stateless JSON (no `Mcp-Session-Id`, no SSE). `initialize` negotiates

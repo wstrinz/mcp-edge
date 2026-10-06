@@ -51,6 +51,8 @@ pub struct ClientRow {
     pub client_id: String,
     pub name: Option<String>,
     pub redirect_uris: Vec<String>,
+    /// Registration time (Unix seconds).
+    pub created: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +65,7 @@ pub struct PendingRow {
     pub code_challenge: String,
     pub backend: String,
     pub scope: String,
+    pub created: i64,
     pub expires: i64,
     pub verified_at: Option<i64>,
     pub used: bool,
@@ -293,7 +296,7 @@ impl Store {
     pub fn client(&self, client_id: &str) -> StoreResult<Option<ClientRow>> {
         self.conn()
             .query_row(
-                "SELECT client_id, name, redirect_uris FROM clients WHERE client_id = ?1",
+                "SELECT client_id, name, redirect_uris, created FROM clients WHERE client_id = ?1",
                 [client_id],
                 |r| {
                     let uris: String = r.get(2)?;
@@ -301,6 +304,7 @@ impl Store {
                         client_id: r.get(0)?,
                         name: r.get(1)?,
                         redirect_uris: serde_json::from_str(&uris).unwrap_or_default(),
+                        created: r.get(3)?,
                     })
                 },
             )
@@ -401,7 +405,7 @@ impl Store {
         self.conn()
             .query_row(
                 "SELECT id, binding_hash, client_id, redirect_uri, state, code_challenge, backend,
-                    scope, expires, verified_at, used FROM pending WHERE id = ?1",
+                    scope, expires, verified_at, used, created FROM pending WHERE id = ?1",
                 [id],
                 |r| {
                     Ok(PendingRow {
@@ -416,6 +420,7 @@ impl Store {
                         expires: r.get(8)?,
                         verified_at: r.get(9)?,
                         used: r.get::<_, i64>(10)? != 0,
+                        created: r.get(11)?,
                     })
                 },
             )

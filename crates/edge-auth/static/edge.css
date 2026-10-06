@@ -13,3 +13,4 @@ table { border-collapse: collapse; width: 100%; display: block; overflow-x: auto
 th, td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid rgba(127, 127, 127, 0.4); }
 form { display: inline; }
 #status { min-height: 1.5em; }
+.warning { border-left: 4px solid #c60; padding: 0.5rem 0.75rem; }

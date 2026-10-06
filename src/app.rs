@@ -515,6 +515,10 @@ async fn mcp_post(
             ))
         }
     };
+    // TODO(phase 3, HTTP forwarder): build the upstream request from scratch;
+    // never copy client headers through, and in particular strip any incoming
+    // `Edge-Assertion` header so only the one minted here reaches the backend.
+    // Sign the exact path and body that are forwarded (today: "/mcp").
     let reply = match &backend.handler {
         Handler::Echo(echo) => echo.handle(Some(&assertion), "POST", "/mcp", &bytes, now),
     };

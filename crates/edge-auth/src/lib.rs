@@ -270,6 +270,15 @@ fn human_duration(secs: i64) -> String {
     }
 }
 
+fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => format!("{s} seconds ago"),
+        s if s < 7200 => format!("{} minutes ago", s / 60),
+        s if s < 2 * 86_400 => format!("{} hours ago", s / 3600),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
 fn format_time(t: i64) -> String {
     // UTC, minute precision, without a date library: days since epoch → civil date.
     let days = t.div_euclid(86_400);
@@ -923,6 +932,7 @@ fn authorize_inner(s: &AuthState, ip: Option<std::net::IpAddr>, query: &str) -> 
         code_challenge: challenge.to_owned(),
         backend: backend.id.clone(),
         scope,
+        created: now,
         expires: now + PENDING_TTL,
         verified_at: None,
         used: false,
@@ -973,6 +983,11 @@ fn consent_page_inner(s: &AuthState, headers: &HeaderMap, query: &str) -> Handle
         resource: &resource,
         scopes: &p.scope,
         grant_lifetime: human_duration(backend.grant_lifetime_secs),
+        requested_ago: ago(now - p.created),
+        client_registered: client
+            .as_ref()
+            .map(|c| format!("{} ({})", format_time(c.created), ago(now - c.created)))
+            .unwrap_or_else(|| "unknown".into()),
         issuer_host: &s.0.issuer_host,
         csrf: csrf.as_deref(),
     };
