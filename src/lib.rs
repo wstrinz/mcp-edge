@@ -1,8 +1,9 @@
 //! `mcp-edge`: one authenticated front door for personal MCP servers.
 //!
-//! Phase 2 composes the OAuth authorization server (`edge-auth`), signed edge
-//! assertions (`edge-assert`) and an in-binary `echo` backend. No request can
-//! reach any other host: the route table only knows built-in backends.
+//! Composes the OAuth authorization server (`edge-auth`), signed edge
+//! assertions (`edge-assert`), an in-binary `echo` backend and (phase 3) an
+//! HTTP forwarder for `kind = "http"` backends. Requests only ever reach the
+//! upstream URLs fixed in the route table; nothing in a request selects one.
 #![forbid(unsafe_code)]
 
 pub mod app;

@@ -659,6 +659,22 @@ display_name = "Echo"
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].id, "echo");
         assert_eq!(routes[0].kind, RouteKind::Echo);
+        // The commented-out http example is valid once uncommented.
+        let shipped = include_str!("../config/routes.toml");
+        let start = shipped.find("# [[backend]]").unwrap();
+        let example: String = shipped[start..]
+            .lines()
+            .map(|l| l.strip_prefix("# ").unwrap_or(l))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let routes = parse_routes(&format!("{}{example}", &shipped[..start])).unwrap();
+        assert_eq!(routes.len(), 2);
+        let hevy = &routes[1];
+        assert_eq!((hevy.id.as_str(), hevy.kind), ("hevy", RouteKind::Http));
+        assert_eq!(
+            hevy.http.as_ref().unwrap().url.as_str(),
+            "https://hevy-mcp.app.stri.nz/mcp"
+        );
     }
 
     fn http_route(extra: &str) -> Result<Vec<Route>, ConfigError> {

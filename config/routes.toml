@@ -1,8 +1,9 @@
 # mcp-edge route table, baked into the image at /etc/mcp-edge/routes.toml.
 #
-# Phase 2 accepts only the built-in diagnostic backend (kind = "echo",
-# consent = "edge"). `http` and `iroh` kinds and `consent = "origin"` are
-# refused at startup until their phases land. Unknown keys are errors.
+# Kinds: the built-in diagnostic backend (kind = "echo") and HTTP upstreams
+# (kind = "http"), both with consent = "edge". `iroh` and consent = "origin"
+# are refused at startup until their phase lands. Unknown keys are errors.
+# See README.md ("Adding an HTTP backend") before adding an upstream.
 
 [[backend]]
 id = "echo"                  # path segment and assertion audience: /echo/mcp
@@ -12,3 +13,19 @@ display_name = "Echo (diagnostic)"
 scopes = ["mcp"]
 grant_lifetime_secs = 86400  # absolute grant lifetime; refresh never extends it
 max_request_bytes = 65536
+
+# Example HTTP backend (not enabled). The upstream must verify Edge-Assertion
+# (aud = "hevy", req over method + "/mcp" + body) before this goes live.
+#
+# [[backend]]
+# id = "hevy"                               # public URL: https://<edge>/hevy/mcp
+# kind = "http"
+# consent = "edge"
+# display_name = "Hevy"
+# url = "https://hevy-mcp.app.stri.nz/mcp"  # exact upstream; signed path is /mcp
+# max_request_bytes = 1048576
+# max_response_bytes = 4194304
+# connect_timeout_secs = 5
+# response_timeout_secs = 20                # time to response headers (<= 25)
+# idle_timeout_secs = 60                    # longest gap between body chunks
+# max_concurrent_per_grant = 4              # in-flight requests + open streams
