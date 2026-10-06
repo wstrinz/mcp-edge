@@ -6,3 +6,8 @@
 !src/**
 !tests
 !tests/**
+!crates
+!crates/**
+!config
+!config/**
+**/target

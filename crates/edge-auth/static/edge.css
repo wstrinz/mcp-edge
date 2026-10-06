@@ -1,0 +1,16 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+body { margin: 0; padding: 16px; }
+main { max-width: 44rem; margin: 0 auto; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; }
+dt { font-weight: 600; }
+dd { margin: 0; overflow-wrap: anywhere; }
+code { overflow-wrap: anywhere; }
+.muted, .note { opacity: 0.75; }
+button { font: inherit; padding: 0.5rem 1rem; margin: 0.25rem 0.25rem 0.25rem 0; cursor: pointer; }
+button.secondary { opacity: 0.85; }
+input { font: inherit; padding: 0.4rem; display: block; margin: 0.25rem 0 0.75rem; width: 100%; max-width: 24rem; }
+table { border-collapse: collapse; width: 100%; display: block; overflow-x: auto; }
+th, td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid rgba(127, 127, 127, 0.4); }
+form { display: inline; }
+#status { min-height: 1.5em; }
+.warning { border-left: 4px solid #c60; padding: 0.5rem 0.75rem; }

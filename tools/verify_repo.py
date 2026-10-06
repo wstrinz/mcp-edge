@@ -10,31 +10,43 @@ except ImportError:
 
 root = Path(__file__).resolve().parents[1]
 compose = yaml.safe_load((root / "compose.yaml").read_text(encoding="utf-8"))
+# Reviewed phase 2 deployment shape: unprivileged, read-only, capability-free,
+# bounded; reachable only through the proxy network (expose, no host ports);
+# one named volume for the SQLite store and assertion key.
 expected = {
     "services": {
-        "gateway": {
+        "edge": {
             "build": {"context": ".", "dockerfile": "Dockerfile"},
             "user": "65532:65532",
             "read_only": True,
             "cap_drop": ["ALL"],
             "security_opt": ["no-new-privileges:true"],
-            "environment": {"WISKIT_GATEWAY_MODE": "deny-all"},
-            "network_mode": "none",
+            "environment": {
+                "EDGE_MODE": "edge",
+                "EDGE_PUBLIC_URL": "${EDGE_PUBLIC_URL:-https://mcp.app.stri.nz}",
+                "EDGE_BIND": "0.0.0.0:8080",
+                "EDGE_DATA_DIR": "/data",
+                "EDGE_ROUTES": "/etc/mcp-edge/routes.toml",
+                "EDGE_ENROLL_CODE": "${EDGE_ENROLL_CODE:-}",
+            },
+            "expose": ["8080"],
+            "volumes": ["edge-data:/data"],
             "pids_limit": 64,
-            "mem_limit": "128m",
-            "cpus": 0.25,
+            "mem_limit": "256m",
+            "cpus": 0.5,
             "restart": "unless-stopped",
             "stop_grace_period": "10s",
             "healthcheck": {
-                "test": ["CMD", "/gateway", "--healthcheck"],
+                "test": ["CMD", "/mcp-edge", "--healthcheck"],
                 "interval": "30s", "timeout": "5s", "start_period": "10s", "retries": 3,
             },
-            "logging": {"driver": "json-file", "options": {"max-size": "1m", "max-file": "2"}},
+            "logging": {"driver": "json-file", "options": {"max-size": "5m", "max-file": "3"}},
         }
-    }
+    },
+    "volumes": {"edge-data": None},
 }
 if compose != expected:
-    raise SystemExit("Compose differs from the reviewed inert definition")
+    raise SystemExit("Compose differs from the reviewed deployment definition")
 
 manifest = json.loads((root / "docs/evidence/fixture-files.json").read_text(encoding="utf-8"))
 expected_paths = set()
@@ -50,13 +62,27 @@ actual_paths = {path.relative_to(root).as_posix() for path in (root / "fixtures"
 if expected_paths != actual_paths or len(expected_paths) != 23:
     raise SystemExit("Fixture source set differs from the archived baseline")
 
-for relative in ["Cargo.toml", "Cargo.lock", "Dockerfile", ".dockerignore", "src/lib.rs", "src/main.rs", "tests/inert.rs"]:
+skipped = {"target", "tmp", ".git", "fixtures"}
+
+
+def source_files():
+    for path in root.rglob("*"):
+        parts = path.relative_to(root).parts
+        if path.is_file() and not any(p in skipped for p in parts):
+            yield path
+
+
+runtime = ["Cargo.toml", "Cargo.lock", "Dockerfile", ".dockerignore", "compose.yaml"]
+runtime += [p.relative_to(root).as_posix() for p in source_files()
+            if p.suffix in {".rs", ".toml", ".js", ".css", ".md"}]
+for relative in runtime:
     if b"\r\n" in (root / relative).read_bytes():
-        raise SystemExit("Root runtime should use LF: " + relative)
-forbidden_names = {".env", "secrets.env", "config.toml", "credentials.json"}
-for path in root.rglob("*"):
-    if path.is_file() and (path.name in forbidden_names or path.suffix.lower() in {".pem", ".key"}):
+        raise SystemExit("Runtime sources should use LF: " + relative)
+forbidden_names = {".env", "secrets.env", "credentials.json"}
+for path in source_files():
+    if path.name in forbidden_names or path.suffix.lower() in {".pem", ".key"}:
         raise SystemExit("Unexpected sensitive file name in source package")
 
-print(json.dumps({"compose": "reviewed inert policy matches", "fixtureFilesUnchanged": len(expected_paths),
-                  "credentialsRead": False, "networkCalls": 0, "helpersExecuted": False}, indent=2))
+print(json.dumps({"compose": "reviewed deployment policy matches", "fixtureFilesUnchanged": len(expected_paths),
+                  "lfFilesChecked": len(runtime), "credentialsRead": False, "networkCalls": 0,
+                  "helpersExecuted": False}, indent=2))

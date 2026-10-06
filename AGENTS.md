@@ -1,14 +1,19 @@
 # Wiskit MCP edge
 
-This repository prepares an optional HTTPS/iroh edge for Wiskit. The current
-deployable root crate is a deny-all HTTP process. It is not an integrated MCP
-gateway. Read README.md, docs/DESIGN.md (current plan), docs/COOLIFY.md and docs/BUILDER-HANDOFF.md first.
+This repository prepares an optional HTTPS/iroh edge for Wiskit. The root
+`mcp-edge` binary runs the original deny-all process by default and, with
+`EDGE_MODE=edge`, the phase 2 OAuth authorization server (`crates/edge-auth`),
+signed assertions (`crates/edge-assert`) and only the built-in `echo` backend.
+It does not forward to any other host. Read README.md, docs/DESIGN.md (current
+plan and phase 2 notes), docs/COOLIFY.md and docs/BUILDER-HANDOFF.md first.
 
 - Keep local Wiskit tracking, peer sync, export and recovery independent of this
   service. No family data, DEKs, real peer identities or credentials belong here.
-- The initial Compose runtime has no networking, published ports, mounts or
-  public domain. Public forwarding, peer enrollment, persistent gateway keys
-  and OAuth require their own completed implementation and approved settings.
+- The phase 2 Compose shape exposes port 8080 to the Coolify proxy network and
+  mounts one data volume; creating the Coolify application, its domain and
+  secrets, and deploying remain owner actions. Public forwarding to other
+  hosts, peer enrollment and origin consent require their own completed
+  implementation and approved settings.
 - Do not add a switch that enables unfinished forwarding. Health is distinct
   from MCP readiness. Preserve fixed errors and avoid logging request bodies,
   Authorization headers, tokens, OAuth codes or family text.
@@ -21,8 +26,9 @@ gateway. Read README.md, docs/DESIGN.md (current plan), docs/COOLIFY.md and docs
   and READMEs. Its PoC binds loopback only and uses ephemeral identities. Its
   OAuth policy fixture is not a production authorization server.
 - Rust 1.93.0 was used; exact dependencies are locked. Run root `cargo test
-  --locked --offline`, `cargo clippy --locked --offline --all-targets -- -D
-  warnings` and `cargo fmt -- --check` for runtime changes. Follow fixture
+  --locked --workspace`, `cargo clippy --locked --workspace --all-targets -- -D
+  warnings` and `cargo fmt --all -- --check` for runtime changes (on Windows
+  set `OPENSSL_DIR`, see README). Follow fixture
   READMEs if modifying those experiments. A Windows check is not a Linux image
   build or proof of web-client compatibility.
 - The owner-run API helper must remain unexecuted by an agent. It uses existing

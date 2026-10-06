@@ -1,5 +1,15 @@
 # One-time repository auto-deploy setup
 
+> **Phase 2 note (2026-10-05).** `compose.yaml` now describes the real edge: service
+> `edge`, `EDGE_MODE=edge`, port 8080 exposed to the Coolify proxy network and a named
+> volume `edge-data`. The inert-runtime statements below (no network, no domain, no
+> mounts) describe the earlier package. The owner helper still creates the
+> application with no domain; after creation set the `edge` service domain to
+> `https://mcp.app.stri.nz:8080` and the `EDGE_ENROLL_CODE` secret, then follow the
+> README's deployment steps. Verify the rendered Compose before enabling auto-deploy.
+> Optionally attach a Traefik `buffering` middleware to the generated router (labels in
+> the README, "Optional: Traefik request buffering").
+
 The preferred route is the owner's existing ordinary Coolify workflow:
 GitHub repository -> existing Coolify GitHub App -> application -> Docker build
 on the selected server -> automatic deployment on the selected branch.

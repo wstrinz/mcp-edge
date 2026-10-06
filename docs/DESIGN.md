@@ -149,3 +149,159 @@ turning remote access off, refuses further requests regardless of edge state.
 - Persistent Wiskit grants (beyond the 24 h trial) and where their state lives.
 - Whether the iroh relay used by the edge should be n0's public relays or self-hosted.
 - CIMD (client ID metadata documents) once Claude's metadata URL can be pinned.
+
+## Phase 2 implementation notes
+
+Status 2026-10-05, branch `phase2-auth`: `edge-assert`, `edge-auth` and the `mcp-edge`
+binary with the built-in `echo` backend are implemented and tested on Windows
+(loopback, software passkey). Not done: Linux image build, Coolify deployment, a real
+claude.ai connector run (the phase 2 acceptance item), `edge-gateway`/`edge-tunnel`/
+`edge-origin` (phases 3–4). Where this document was silent, the conservative choice
+below was taken.
+
+**Owner proof and consent**
+- Proof is per authorization request. `/authorize` creates a pending request bound to
+  the browser by a `__Host-` cookie; the passkey ceremony must be started *for that
+  request* from that browser, and its result must be under 5 minutes old when the
+  CSRF-protected consent form is submitted. An owner session (from `/owner`) never
+  approves consent by itself. Pending requests live 10 minutes and are one-shot.
+- Consent phishing: anyone can register a client and send the owner an authorization
+  link. The consent page leads with "Approve only if you just clicked Connect in Claude
+  yourself", shows how long ago the request was made and when the client registered,
+  and labels the client name as self-reported.
+- Errors before the client and exact redirect URI are verified render a 400 page and
+  never redirect. Later errors redirect with `error` and `iss` (and `state` if valid).
+- Browser POSTs with an `Origin` other than the issuer are refused; JSON endpoints
+  require `application/json`. Cookies: `__Host-`, `HttpOnly`, `Secure`, `SameSite=Lax`.
+  Pages send a strict CSP whose `form-action` also lists the redirect-allowlist
+  origins (the consent POST answers with a redirect there).
+- Enrollment: the code must be ≥ 16 ASCII characters (otherwise ignored, enrollment
+  disabled); it is compared as SHA-256 digests in constant time (no length leak), and
+  stored only as a hash when consumed, in the same transaction as the first passkey.
+  Once any passkey exists codes are never accepted again. Wrong codes are limited to 10
+  per client network per 15 minutes and 100 across all networks per hour; both locks
+  lift by themselves, and check-compare-increment happens under one lock. A stranger
+  can no longer block the owner's network, and guessing stays bounded globally. Adding passkeys needs an owner session
+  authenticated within 5 minutes. There is no passkey removal yet; recovery from lost
+  passkeys is "wipe the volume, enroll again", which also revokes everything.
+- The owner id (`sub`) is a random UUID created on first start.
+
+**Codes and tokens**
+- `resource` is required at `/authorize` and must name `<issuer>/<backend>/mcp`. Both
+  sides are normalized before an exact comparison: scheme and host lowercased, default
+  port dropped, dot segments resolved, one trailing `/` removed; query, fragment and
+  userinfo are refused. At `/token` it is optional; if present it must match, or the
+  result is `invalid_grant` (the checklist's code, rather than RFC 8707's
+  `invalid_target`). `redirect_uri` at `/token` is optional (PKCE plus the client
+  binding already tie the code to its client) but must match exactly when present.
+- Scopes: a requested `scope` is intersected with the backend's scopes; if nothing
+  overlaps, the backend's default scopes are granted (no `invalid_scope`), so clients
+  that send unrelated scopes still connect. Grants never exceed the backend's scopes.
+- Any presentation of a code consumes it: a failed exchange (wrong verifier, client,
+  redirect, resource, expiry) burns the code and its pending grant; presenting an
+  already-used code also revokes the grant it produced.
+- Public clients only: an `Authorization` header or `client_secret` at `/token` or
+  `/revoke` is `invalid_client`, as is an unknown `client_id`.
+- A rotated refresh token presented again, or a refresh token presented by a different
+  client, revokes the whole grant ("family" = grant). One exception for lost responses
+  and retries: the immediately-previous token (its successor is the current active
+  token), re-presented by the same client within 30 s of its rotation, gets a fresh
+  pair and the current token is retired; the window is measured from the original
+  rotation and never extends. Refresh never extends the grant's
+  absolute lifetime; a `scope` parameter on refresh is ignored (tokens always carry
+  exactly the granted scope).
+- `/revoke` (RFC 7009) revokes the whole grant for either token type; tokens of other
+  clients and unknown tokens get 200 with no effect. Revocation increments `gen`.
+- Secrets (tokens, codes, cookies) are 256-bit random values stored as unsalted
+  SHA-256; grants, codes and sessions are in SQLite (`EDGE_DATA_DIR/edge.db`); WebAuthn
+  ceremony state is memory-only (5 minutes). Revoked/expired grants are deleted 7 days
+  after creation; never-used client registrations are pruned after 1 hour when the
+  100-client cap is reached.
+- All SQLite work (and WebAuthn verification) runs on tokio's blocking pool, never on
+  the async workers; `/healthz` touches no store and `/readyz` checks it with a 2 s
+  deadline. A grant's `last_used` is written at most once a minute.
+- DCR accepts at most 4 redirect URIs, all exact allowlist members; unknown metadata
+  is ignored; any requested `token_endpoint_auth_method` is substituted with `none`
+  (RFC 7591 §3.2.1) and returned as such; `client_name` is stripped of control
+  characters, cut to 80 characters and always HTML-escaped. Registrations from all
+  Claude users may share Anthropic egress addresses, so there is effectively no global
+  registration rate cap (10 000 per hour); the per-IP limit is 20 per hour and the
+  100-client cap with pruning bounds storage.
+
+**Assertions**
+- The signature covers `"edge-assert.v1." + <payload segment>`; `req` is
+  base64url(SHA-256) and `path` is the path the backend receives (`/mcp`). Claims are
+  canonical JSON (integers only); the Rust verifier rejects non-canonical payloads and
+  unknown claims and allows 5 s skew. `resource_scope` is `{}` for edge-consent
+  backends; `gen` starts at 1.
+- The signing seed is `EDGE_DATA_DIR/assertion-key.bin`, created on first start
+  atomically: written and fsynced to a temporary file in the same directory, then
+  hard-linked into place (never replacing an existing file), then the directory is
+  fsynced. Crash leftovers are only stray temporaries, removed on the next start; an
+  existing file of the wrong size stops startup instead of being replaced. Rotation is manual
+  (delete the file, update backends). Backends get the key from
+  `/.well-known/edge-assertion-key` or the startup log, configured out of band.
+- For phase 3 (noted as a TODO at the dispatch point in `src/app.rs`): the HTTP
+  forwarder must build upstream requests from scratch, strip any client-supplied
+  `Edge-Assertion` header, and sign exactly the path and body it forwards.
+
+**Transport and limits**
+- MCP is stateless JSON (no `Mcp-Session-Id`, no SSE). `initialize` negotiates
+  2025-11-25, 2025-06-18 or 2025-03-26 (default 2025-06-18); an `MCP-Protocol-Version`
+  header, if present, must be one of these; batches are rejected; notifications get 202.
+  The bearer token is checked before the body is read.
+- Slow requests: Traefik streams request bodies, so a slowloris body reaches the edge.
+  Each client network may have at most 8 requests in flight (`/healthz` exempt), and
+  any non-MCP request body (OAuth forms, WebAuthn JSON) must arrive within 5 s (408)
+  and fit 64 KiB before routing; MCP bodies are read only after authentication within
+  the overall deadline. An optional Traefik `buffering` middleware is documented in
+  the README.
+- Limits: 1024 connections; 10 s header deadline; 5 min connection lifetime; 30 s
+  request deadline; 32 KiB of request headers (enforced explicitly: hyper's read-buffer
+  limit is not a strict cap, which also let the old deny-all server serve a 32 KiB
+  header intermittently — fixed there too); bodies 16 KiB (OAuth forms), 64 KiB
+  (WebAuthn), per-backend MCP cap (default 1 MiB, echo 64 KiB). Per client IP per
+  minute: 600 requests, 30 authorize, 60 token/revoke, 20 owner ceremonies; 20
+  registrations per hour per IP; 300 MCP requests per grant per minute.
+  Anonymous state never refuses the owner (found in review: a refusing cap let one
+  anonymous IP lock the owner out of login and consent). WebAuthn ceremonies (~1 KiB)
+  are capped at 4 per client network and 4096 overall; when full, anonymous logins are
+  evicted before ceremonies bound to a pending request or a registration, oldest
+  first. Pending authorization requests are capped at 4 unverified per network and
+  4096 overall; only unverified ones are ever evicted (oldest first), never one with a
+  passkey proof. Displacing the owner's in-progress state needs thousands of networks. A response cap is not needed for the in-binary echo and
+  belongs to the HTTP forwarder in phase 3.
+- Client IP is the TCP peer. Only when the peer is inside `EDGE_TRUSTED_PROXIES`
+  (default RFC 1918, loopback and `fc00::/7`, since only Coolify's Traefik can reach
+  the container) is `X-Forwarded-For` read, taking the right-most hop that is not a
+  trusted proxy; an unparsable hop ends the walk. IPv6 is limited per /64. The
+  limiter holds at most 10 000 keys; when all are live it evicts the window closest
+  to expiry rather than refusing the new client (a flood can reset someone's budget
+  early, never lock out a newcomer).
+- Logs: one line per request (method, route template, status, ms, backend, grant id)
+  plus named events (`consent_approved`, `refresh_reuse`, `grant_revoked`, ...). A test
+  greps captured logs for every secret the flow produced.
+
+**Deployment shape**
+- `EDGE_MODE` unset still runs the inert deny-all process; `compose.yaml` sets `edge`.
+  The compose service exposes 8080 to the Coolify proxy network (no host port), mounts
+  the named volume `edge-data` at `/data`, and keeps read-only rootfs, `cap_drop: ALL`,
+  `no-new-privileges`, UID 65532 and pids/memory/CPU limits.
+- `webauthn-rs` depends on OpenSSL (a C dependency the design did not anticipate). The
+  image links it statically; Windows development needs `OPENSSL_DIR`.
+
+**Checklist coverage** (tests run against the real server on an ephemeral loopback
+port): 1 `security.rs::checklist_1_*` (+ enrollment tests); 2 `checklist_2_*`;
+3 `checklist_3_*`; 4 `checklist_4_*`; 5 `checklist_5_*`; 6 `edge-assert` unit tests and
+`tests/echo_assertions.rs`; 8 `oauth_flow.rs::logs_never_contain_*`. Item 7 does not
+apply until a forwarder exists; absolute-form, `CONNECT`, unknown-backend and
+odd-path requests are already covered.
+
+**Open questions from phase 2**
+- Does claude.ai send `resource` on `/authorize` and `/token`, and `redirect_uri` on
+  `/token`? Both are required/enforced here; a real connector run must confirm.
+- Should one owner session be allowed to approve several requests (fewer passkey
+  prompts) instead of per-request proof?
+- The prepared owner Coolify helper still creates the application with no domain and
+  an "inert" description; phase 2 needs the domain set (see README).
+- Backup policy for the `edge-data` volume (grants and the assertion key).

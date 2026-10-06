@@ -2,21 +2,33 @@
 # Tests and final compilation are offline after a locked public-registry fetch.
 FROM rust:1.93.0-alpine@sha256:69d7b9d9aeaf108a1419d9a7fcf7860dcc043e9dbd1ab7ce88e44228774d99e9 AS build
 WORKDIR /build
-ENV CARGO_BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=2 \
+    OPENSSL_STATIC=1
+# webauthn-rs needs OpenSSL; link it statically so the final image stays FROM scratch.
+# rusqlite builds its bundled SQLite with the C compiler.
+RUN apk add --no-cache gcc musl-dev openssl-dev openssl-libs-static pkgconf
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 COPY src ./src
 COPY tests ./tests
 RUN cargo fetch --locked
 RUN --network=none set -eu; \
-    cargo test --locked --offline --release; \
-    cargo build --locked --offline --release; \
-    readelf -l target/release/wiskit-gateway-inert > /tmp/program-headers; \
-    if grep -q INTERP /tmp/program-headers; then echo 'Refusing dynamically linked binary'; exit 1; fi
+    cargo test --locked --offline --release --workspace; \
+    cargo build --locked --offline --release --bin mcp-edge; \
+    readelf -l target/release/mcp-edge > /tmp/program-headers; \
+    if grep -q INTERP /tmp/program-headers; then echo 'Refusing dynamically linked binary'; exit 1; fi; \
+    mkdir -p /out/data
 
 FROM scratch
-COPY --from=build /build/target/release/wiskit-gateway-inert /gateway
+COPY --from=build /build/target/release/mcp-edge /mcp-edge
+COPY config/routes.toml /etc/mcp-edge/routes.toml
+# A new named volume mounted at /data inherits this ownership.
+COPY --from=build --chown=65532:65532 /out/data /data
 USER 65532:65532
-ENV WISKIT_GATEWAY_MODE=deny-all
+ENV EDGE_MODE=edge \
+    EDGE_BIND=0.0.0.0:8080 \
+    EDGE_DATA_DIR=/data \
+    EDGE_ROUTES=/etc/mcp-edge/routes.toml
 EXPOSE 8080/tcp
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/gateway", "--healthcheck"]
-ENTRYPOINT ["/gateway"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/mcp-edge", "--healthcheck"]
+ENTRYPOINT ["/mcp-edge"]

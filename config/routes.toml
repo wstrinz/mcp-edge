@@ -1,0 +1,14 @@
+# mcp-edge route table, baked into the image at /etc/mcp-edge/routes.toml.
+#
+# Phase 2 accepts only the built-in diagnostic backend (kind = "echo",
+# consent = "edge"). `http` and `iroh` kinds and `consent = "origin"` are
+# refused at startup until their phases land. Unknown keys are errors.
+
+[[backend]]
+id = "echo"                  # path segment and assertion audience: /echo/mcp
+kind = "echo"
+consent = "edge"
+display_name = "Echo (diagnostic)"
+scopes = ["mcp"]
+grant_lifetime_secs = 86400  # absolute grant lifetime; refresh never extends it
+max_request_bytes = 65536
