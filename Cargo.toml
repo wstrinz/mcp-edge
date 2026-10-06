@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/edge-assert"]
+members = [".", "crates/edge-assert", "crates/edge-auth"]
 resolver = "2"
 
 [workspace.package]
