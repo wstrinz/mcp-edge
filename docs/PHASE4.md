@@ -450,8 +450,9 @@ approval of either kind is logged (`event=origin_approval_invalid`) and treated 
 On approve the edge, in one transaction: consumes the pending row; creates the grant
 with the given `grant_id`, `resource_scope`, `expires = now + lifetime_secs`, `gen = 1`;
 stores the approval string on the grant row (evidence); creates the one-use code.
-`create_grant_with_code` gains `resource_scope` and `expires` parameters (it currently
-hard-codes `'{}'` and the route lifetime).
+`create_grant_with_code` gains a `resource_scope` parameter (it currently hard-codes
+`'{}'`) and is called with `grant_expires = now + lifetime_secs` instead of the route
+lifetime.
 
 ### 3.6 Revocation and `gen`
 
@@ -599,3 +600,122 @@ Never stored: assertions, tokens, codes, pairing codes, nonces, JSON-RPC params 
 | PC sleep/wake | Grants kept (memory), endpoint reconnects | Requests during sleep fast-fail `origin_offline`; recover without consent |
 | Edge restart | — | Grants in SQLite survive; first connection runs `grant_sync` |
 | Wiskit identity locked | `origin_locked` for MCP and consent | 503 |
+
+## 5. Edge changes
+
+| Area | Change |
+|---|---|
+| Config (`src/config.rs`) | `kind = "iroh"` accepted with `origin_endpoint_env`, `max_response_bytes` (default 1 MiB, ≤ 4 MiB); in v1 `kind = "iroh"` requires `consent = "origin"` and vice versa; the Wiskit route's scopes are `["wiskit:read"]`; stays refused until the whole phase lands (AGENTS.md: no switch for unfinished forwarding) |
+| Identity | `EDGE_DATA_DIR/iroh-edge.key` via the `keyfile.rs` procedure; EndpointId in startup log and `/owner`; never logged as a secret |
+| `edge-tunnel` crate (new) | Framing (§2.3), meta types with `deny_unknown_fields`, caps, terminator, op enum, close codes, approval sign/verify (`mcp-edge-approval.v1.`) with a pinned test vector. No HTTP, no iroh `Router` policy; depends on iroh `=1.3.0` (same as Wiskit's lock) |
+| `edge-origin` crate (new) | `OriginHandler<A: OriginApp>` implementing iroh `ProtocolHandler`: peer admission, connection/stream caps, intake deadlines, assertion verification + replay cache (`edge-assert`), stream-stop → cancellation token, dispatch to the app trait (`mcp_post`, `consent_request`, `grant_sync`, `grant_revoke`, `ping`). The app owns grant records and MCP |
+| `edge-gateway` (phase 3) | `IrohForwarder`: one cached connection per route, fast-fail state (§2.8), per-route and per-grant in-flight limits, deadlines (§2.6), response streaming with total cap, `grant_sync` on connect, maps origin errors (§2.7). Builds meta from scratch; the client's `Edge-Assertion`, `Authorization`, cookies and other headers never cross |
+| `edge-auth` | `ConsentMode::Origin`; pending row gains `origin_state`, `pairing_code`, `attempts`, `grant_id`, `nonce`; grants gain `approval`; `create_grant_with_code(…, resource_scope, …)`; routes `POST /consent/start`, `GET /consent/status`, `POST /consent/finish`, `POST /consent/cancel` (same cookie, CSRF and Origin rules as `/consent`); a port trait `OriginConsent` implemented by the gateway so `edge-auth` stays iroh-free; revocation calls an optional `on_revoke(grant_id, gen)` hook (best-effort `grant_revoke`) |
+| Assertions | For iroh routes, minted assertion ≤ 8 KiB (else 500 + log) |
+| Consent page | For origin backends: data-export warning, pairing code, attempts left, status polling, cancel; never shows tracker names (the edge never learns them) |
+| `/owner` | Enrollment string + fingerprint (`sub`, `edge_id`, `assert_key`, issuer, backend); origin status from `ping` |
+| Logs | New events `origin_dial_failed`, `origin_offline`, `origin_rejected_edge`, `origin_approval_invalid`, `consent_sent`, `consent_origin_approved`, `consent_origin_denied`, `grant_sync_revoked`; never pairing codes, nonces, approvals, tracker ids, bodies |
+| Deployment | Compose service keeps its current network; container needs outbound UDP and DNS; no new published ports; the `edge-data` volume now holds a third secret file. Coolify env var `EDGE_ORIGIN_WISKIT` is an owner action |
+
+## 6. Wiskit app changes and release mapping
+
+### 6.1 Rust (`src-tauri/`)
+
+| File / module | Change |
+|---|---|
+| `Cargo.toml` | Add `edge-origin`, `edge-tunnel`, `edge-assert` (git, pinned rev; D8); behind cargo feature `mcp-edge-origin`, compiled only for desktop targets |
+| `iroh/mod.rs` | Add `mcp-edge/1` to `alpns(...)` and `.accept(...)` in **both** Router branches; include it in `iroh:router-ready`; keep the single persisted endpoint |
+| `iroh/mod.rs` (`load_or_create_secret_key`) | D7: wrong-length file moved aside and logged instead of silently replaced |
+| `mcp/remote/mod.rs` (new) | `OriginApp` impl: enrollment state, remote mode state machine (§4.6), epoch |
+| `mcp/remote/grants.rs` (new) | `RemoteGrantStore` (memory), `RemoteGrantContext`, tombstones, `grant_sync`/`grant_revoke` |
+| `mcp/remote/consent.rs` (new) | One pending prompt, code check (3 tries), approval signing with the transport key + domain separation |
+| `mcp/remote/adapter.rs` (new) | Stateless MCP JSON adapter (§4.4), two tools, cursor codec, 1 MiB budget |
+| `mcp/remote/audit.rs` (new) | `mcp_remote_audit` table, fail-closed writes, pause |
+| `mcp/broker.rs` | `handle_remote` entry, remote allowlist, pre-check, post-check, per-grant cancellation |
+| `mcp/bridge.rs` | `RemoteBridgeScope` in payload and pending entry; `cancel_grant`, `cancel_remote_all` |
+| `mcp/mod.rs` | Tauri commands: `remote_enroll(enrollment)`, `remote_unenroll`, `remote_status`, `remote_set_enabled(bool)`, `remote_resume`, `remote_list_grants`, `remote_revoke_grant(id)`, `remote_revoke_all`, `remote_consent_pending`, `remote_consent_decide(code, trackers, lifetime, approve)`; main-webview only, like `mcp_bridge_respond` |
+
+### 6.2 Frontend (`src/`)
+
+| File | Change |
+|---|---|
+| `lib/mcp/bridge-dispatch.ts` | Remote mode: filter list, remote projection, pagination (`limit`, `before`, `nextCursor`), attachment-field stripping; pure + unit tests |
+| `lib/mcp/agent-bridge.ts` | Install the listener when local **or** remote access is on |
+| `lib/mcp/remote-access.ts` (new) | Enrollment parse/validate + fingerprint (mirrors Rust; Rust is authoritative), status store |
+| Settings: Agent access section | "Remote access (mcp-edge)" panel: enroll / show own EndpointId / fingerprint, switch, state (`off`/`on`/`paused`/`stale`), active remote grants with Revoke and Revoke all, Stop all agent access |
+| Consent modal (new component) | Request details, code entry, tracker checklist (owned only, none preselected), lifetime, export notice, Approve/Deny; `data-testid`s: `remote-consent-modal`, `remote-consent-code`, `remote-consent-tracker-{id8}`, `remote-consent-lifetime`, `remote-consent-approve`, `remote-consent-deny` |
+| Agent Activity | Render `mcp_remote_audit` rows with a Remote badge |
+
+### 6.3 What ships when
+
+| Release | Wiskit | Edge | Contents |
+|---|---|---|---|
+| Phase 4A | — | branch only | `edge-tunnel`, `edge-origin`, gateway iroh forwarder, origin consent; tests against an in-repo fake origin |
+| Wiskit 1.7.0-dev (not distributed) | dev/debug builds with `mcp-edge-origin` | 4A merged | Origin integration for phases 4B–4D on synthetic profiles |
+| Wiskit 1.7.0 | Windows NSIS: feature compiled in, remote mode default off, read-only, two tools, memory-only grants. iPhone TestFlight: feature compiled out | `mcp-edge` 0.4.0 with `kind = "iroh"` | Only after 4D passes and the owner approves real-data use (4E) |
+| Wiskit 1.8.x (candidate) | — | — | D1 persistent grants; scoped `wiskit_search`; anything else needs its own spec |
+
+## 7. Tests, phased acceptance, failure modes
+
+### 7.1 Test layers
+
+| Layer | Where | Must cover |
+|---|---|---|
+| Unit: `edge-tunnel` | edge repo | Every cap (meta, body, chunk, total) at limit and +1; length checked before allocation; unknown field/op/version; trailing request bytes; missing terminator = error; approval test vector; approval with each claim wrong; non-canonical payload |
+| Unit: `edge-origin` | edge repo | Unadmitted peer; assertion wrong sig/iss/aud/exp/req/jti/sub/scope/`iat` before start; replay cache full rejects; cancellation token fires on stream stop |
+| Integration: loopback iroh (relays off, PoC endpoint setup) | edge repo | All 12 PoC behaviours retained (admission before dial, injection, smuggling, redirects/proxy traps n/a by construction but kept as "no URL field" tests, caps, backpressure, concurrency, cancellation, offline origin), plus: fast-fail ≤ 3 s and immediate during offline window; `grant_sync` revokes unknown; consent happy path, deny, timeout, cancel, origin busy, invalid approval, retry limit; origin error → HTTP mapping table §2.7 row by row |
+| Edge auth | edge repo | No code without approval for origin backends (checklist 1 extended); approval for a different tx/nonce/grant/client/edge rejected; lifetime > route max rejected; `resource_scope` flows into assertions; revocation hook called |
+| Wiskit Rust | `scripts/test-rust.py` | Remote allowlist; tracker pre-check; post-check blocks a forged WebView result with an extra tracker or foreign event (`leak_blocked`); gen mismatch; expired/revoked/tombstone; two grants sharing one `client_id` stay independent; `notifications/cancelled` of grant A cannot cancel grant B; revoke mid-bridge discards result; remote off cancels; audit insert failure pauses; stale enrollment forces off; approval signature verifies with `edge-tunnel` |
+| Wiskit TS | `bun run test:unit` | Remote projection removes `owner`, `deckId`, `attachmentIds`, attachment fields; pagination cursor round trip; list filtering |
+| Two synthetic trackers + one shared-in tracker | Wiskit e2e (smoke-style, isolated profile) | Only owned trackers offered; granted A readable, B refused, C (shared-in) never offered |
+
+### 7.2 Phased acceptance
+
+| Phase | Setup | Accept when |
+|---|---|---|
+| 4A | Edge with fake origin, loopback, relays off | §7.1 edge rows green on Windows and in the Linux image build |
+| 4B | Edge (local) + Wiskit 1.7.0-dev on a disposable synthetic profile, loopback iroh, private mDNS service type, launched via the Scheduled Task path (MSIX trap), never next to the real app | Enroll both ways; consent in app; `initialize`, `tools/list`, list (filtered), read (paged), forbidden tracker, revoke in app, revoke at edge, remote off, app restart, cancellation; audit rows match; no family data anywhere |
+| 4C | Deployed edge on Coolify (owner deploys, sets `EDGE_ORIGIN_WISKIT`) + 4B app on the home PC, n0 relay | Same as 4B over the public path; PC asleep → 503 within 3 s; wake → works without consent; record dial/first-byte latencies (p50/p95 over 50 calls) |
+| 4D | Synthetic-only Claude account, synthetic Wiskit profile | Handoff phase 5 list: discover, register, consent (edge passkey + app), code exchange, initialize, tools/list, allowed read, forbidden tracker, refresh + replay, revoke, restart, origin offline (capture what Claude shows for 503), disconnect/cancel. Protocol/status/timing captured without credentials or payloads |
+| 4E | Real profile, real trackers | Owner's explicit data-export consent; then one tracker for one day. Recovery check: edge absent, edge key lost, Wiskit transport key changed — local use, sync and backup unaffected, re-enrollment works |
+
+### 7.3 Failure modes
+
+| Failure | Detection | User-visible result | Data effect |
+|---|---|---|---|
+| PC off/asleep, Wiskit closed | dial fails / timeout | 503 `origin_offline` in ≤ 3 s | none |
+| Remote mode off / paused / stale | origin close code or error | 503 with reason | none |
+| Wiskit locked | `origin_locked` | 503 | none |
+| Origin restarted (trial) | `unknown_grant` | 401 → Claude asks to reconnect | grant revoked at edge |
+| Owner revoked in app | `grant_revoked` | 401 → reconnect | edge grant revoked |
+| Edge revoked, origin offline | `grant_sync` later | — | origin tombstone/expiry |
+| Edge volume lost | origin `peer_not_admitted` | 503 `origin_rejected_edge`; all grants gone | re-enroll + reconnect |
+| Wiskit transport key changed | app start check | remote stuck `stale`; edge sees offline | re-enroll both sides |
+| Assertion key mismatch | `assertion_invalid` | 502 | none |
+| WebView returns out-of-scope data | Rust post-check | tool error; audit `leak_blocked` | nothing emitted |
+| Audit DB unwritable | insert error | 503 `origin_paused` until owner resumes | none |
+| Bundle too large | budget check | tool error `result_too_large` | none |
+| Relay unavailable, no direct path | dial fails | 503 `origin_offline` | none |
+| Clock skew > 5 s at origin | `assertion_invalid` on `iat`/`exp` | 502 | none (log hints at clock) |
+| Consent stream lost mid-decision | edge stream error | page: "Wiskit not reachable" + Try again | app drops prompt and any unsent record |
+| Flood from Claude | per-grant limits | 429 | none |
+
+## 8. Open decisions for the owner
+
+| # | Decision | Recommended default |
+|---|---|---|
+| D1 | Persist origin grant records (and the remote-mode switch) across Wiskit restarts? | **No for the trial** (memory only, off at start). Revisit after 4D; if yes, store records without secrets in `wiskit.db` and replace the `iat`-after-start rule with a persisted replay window |
+| D2 | Key that signs consent approvals | **Wiskit transport key**, domain-separated. Alternative: a dedicated `remote-approval.key` enrolled alongside (independent rotation, one more file to protect) |
+| D3 | Pairing code: owner types it in the app, or compares two displayed codes | **Type it** (defeats approve-without-looking; one prompt at a time anyway) |
+| D4 | Which trackers can be granted | **Only trackers owned by this identity**; shared-in trackers excluded until per-tracker export consent from their owner is designed |
+| D5 | Relay and discovery | **n0 public relays + DNS** for trial; self-hosted relay only if metadata exposure to n0 is unacceptable (it changes Wiskit's family-wide relay) |
+| D6 | Where the edge stores the origin EndpointId | **Coolify secret env var** referenced from `routes.toml` (out of git, owner-only change) |
+| D7 | Stop Wiskit silently regenerating a wrong-length `secret.key` | **Yes**, move aside + log, in 1.7.0 (also benefits peer sync diagnosis) |
+| D8 | How Wiskit consumes `edge-origin`/`edge-tunnel`/`edge-assert` | **Git dependency pinned to a commit**, iroh pinned identically (`=1.3.0`); vendoring only if Wiskit's release process requires offline builds |
+| D9 | Back up the `edge-data` volume (assertion key, iroh key, grants) | **Yes**, encrypted, owner-held; loss costs re-enrollment and reconnects, never Wiskit data |
+| D10 | Write tools remotely | **Not in phase 4.** Needs its own spec: completion-or-not semantics (no physical cancel), per-tracker write scope, verbose audit |
+| D11 | Trial lifetimes | **Default 1 h, choices 1 h / 8 h / 24 h**, route max 24 h; access token 15 min as phase 2 |
+| D12 | Expose event authors / tracker owners remotely | **No** (identity ids stripped); revisit with a display-name mapping if useful |
+| D13 | Remote mode on iPhone | **Never in phase 4** (compiled out; iOS cannot keep the endpoint up anyway) |
+| D14 | Offline response shape | **HTTP 503 + JSON-RPC error body + `Retry-After`**; switch to a 200 tool error only if 4D shows Claude handles 503 badly |
+| D15 | One shared "Stop all agent access" control in addition to the two independent switches | **Yes** |

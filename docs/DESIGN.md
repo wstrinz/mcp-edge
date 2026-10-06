@@ -136,6 +136,7 @@ turning remote access off, refuses further requests regardless of edge state.
 4. **Wiskit over iroh.** `edge-tunnel` + `edge-origin`, origin consent in the app, a remote
    Streamable HTTP MCP endpoint with `RemoteGrantContext`, read-only tools first (BUILDER-HANDOFF
    phases 1, 2, 5 and 6 apply). Acceptance per the handoff's synthetic-account trial.
+   Specification (draft for owner review): [PHASE4.md](PHASE4.md).
 5. **Library polish.** Publish-ready crate docs and examples once two backends of each kind work.
 
 ## Decisions taken (2026-10-05)
