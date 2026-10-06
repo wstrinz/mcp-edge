@@ -280,6 +280,14 @@ display_name = "Echo"
 "#;
 
     #[test]
+    fn shipped_route_table_is_valid() {
+        let routes = parse_routes(include_str!("../config/routes.toml")).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].id, "echo");
+        assert_eq!(routes[0].kind, RouteKind::Echo);
+    }
+
+    #[test]
     fn route_table_accepts_echo_and_rejects_unavailable_kinds() {
         let routes = parse_routes(ROUTES).unwrap();
         assert_eq!(routes[0].id, "echo");

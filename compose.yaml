@@ -1,6 +1,12 @@
-# Private build/test definition. No public domain, proxy network or host port.
+# mcp-edge deployment shape for a Coolify "Docker Compose" application.
+# Coolify's Traefik terminates TLS for the domain configured on this service
+# (https://mcp.app.stri.nz:8080 in the Coolify UI) and reaches the container
+# over Coolify's network on the exposed port; no host port is published.
+# EDGE_ENROLL_CODE is a Coolify secret, set only for the first owner passkey
+# enrollment and then removed. Nothing here is deployed by committing it to a
+# non-deployment branch.
 services:
-  gateway:
+  edge:
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,15 +15,24 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     environment:
-      WISKIT_GATEWAY_MODE: deny-all
-    network_mode: none
+      EDGE_MODE: edge
+      EDGE_PUBLIC_URL: ${EDGE_PUBLIC_URL:-https://mcp.app.stri.nz}
+      EDGE_BIND: 0.0.0.0:8080
+      EDGE_DATA_DIR: /data
+      EDGE_ROUTES: /etc/mcp-edge/routes.toml
+      EDGE_TRUST_FORWARDED_FOR: "1"
+      EDGE_ENROLL_CODE: ${EDGE_ENROLL_CODE:-}
+    expose:
+      - "8080"
+    volumes:
+      - edge-data:/data
     pids_limit: 64
-    mem_limit: 128m
-    cpus: 0.25
+    mem_limit: 256m
+    cpus: 0.5
     restart: unless-stopped
     stop_grace_period: 10s
     healthcheck:
-      test: [CMD, /gateway, --healthcheck]
+      test: [CMD, /mcp-edge, --healthcheck]
       interval: 30s
       timeout: 5s
       start_period: 10s
@@ -25,5 +40,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: 1m
-        max-file: "2"
+        max-size: 5m
+        max-file: "3"
+
+volumes:
+  edge-data:
