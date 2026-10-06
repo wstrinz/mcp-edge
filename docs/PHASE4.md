@@ -700,7 +700,10 @@ Never stored: assertions, tokens, codes, pairing codes, nonces, JSON-RPC params 
 | Consent stream lost mid-decision | edge stream error | page: "Wiskit not reachable" + Try again | app drops prompt and any unsent record |
 | Flood from Claude | per-grant limits | 429 | none |
 
-## 8. Open decisions for the owner
+## 8. Decisions
+
+**Accepted 2026-10-06 by the owner: every recommended default below (D1–D15), as written.**
+
 
 | # | Decision | Recommended default |
 |---|---|---|
