@@ -1,69 +1,116 @@
-# Wiskit MCP edge
+# mcp-edge (repository `wiskit-mcp-edge`)
 
 Dedicated repository: **`wstrinz/wiskit-mcp-edge`**, private, with **`main`** as
-the intended Coolify deployment branch. The owner approved repository creation
-and publication on 2026-10-05. Coolify setup and deployment remain pending.
+the intended Coolify deployment branch. **Current plan: [docs/DESIGN.md](docs/DESIGN.md)**:
+a generic, OAuth-hardened front door for all the owner's MCP servers, with Wiskit
+as the first iroh backend. The [builder handoff](docs/BUILDER-HANDOFF.md) still
+holds its safety rules and Wiskit details.
 
-The intended service gives ordinary HTTPS MCP clients an optional route to an
-online local Wiskit instance through iroh. Local use, peer sync and data recovery
-must remain independent of the edge. The production Wiskit adapter and OAuth
-integration are still pending. **Current plan: [docs/DESIGN.md](docs/DESIGN.md)**: a generic, OAuth-hardened
-front door for all the owner's MCP servers, with Wiskit as the first iroh backend. The
-[builder handoff](docs/BUILDER-HANDOFF.md) still holds its safety rules and Wiskit details.
+Local Wiskit use, peer sync and data recovery must remain independent of the edge.
 
-## What is implemented
+## Status: phase 2 (auth + echo), deployable but not deployed
 
-The root Rust crate is the current preparatory **deny-all** process. `/healthz`
-reports process health; `/readyz` and `/mcp` return `503 forwarding_disabled`.
-Other paths return fixed errors. It does not read or reflect request bodies,
-dial peers, implement OAuth, load Wiskit data or create persistent identities.
-There is no activation switch. Six actual loopback HTTP tests cover parser,
-timeout, admission and fixed-response behavior.
+| Piece | State |
+|---|---|
+| `crates/edge-assert` | Signed, request-bound Ed25519 assertions; mint + verify + replay cache. Format spec and test vector in [its README](crates/edge-assert/README.md). |
+| `crates/edge-auth` | OAuth 2.1 authorization server: RFC 8414/9728 metadata, RFC 7591 public-client DCR, S256 PKCE, passkey (WebAuthn) owner proof, consent, one-use codes, rotating refresh with family revocation, RFC 7009 revocation, owner grant page, SQLite store. |
+| `mcp-edge` (root binary) | `EDGE_MODE=edge`: the above plus a closed route table whose only backend kind is the built-in `echo`. `EDGE_MODE=deny-all` (the default when unset): the original inert process. |
+| iroh tunnel / origin / HTTP backends | Not implemented (phases 3–4). `kind = "http"`, `kind = "iroh"` and `consent = "origin"` are refused at startup. |
 
-`fixtures/iroh-transport-poc/` contains the actual bounded iroh/HTTP transport
-experiment and its 12 passing-test record. `fixtures/claude-compat/` contains the
-14-test synthetic OAuth/MCP policy fixture. Both are copied byte-for-byte from
-their verified archives. They provide implementation starting points and test
-evidence; the Docker build does not package them as a live forwarder.
+No Coolify resource, domain or deployment was created. Linux container build and a
+real claude.ai connector run are **unverified** (see [phase 2 notes](docs/DESIGN.md#phase-2-implementation-notes)).
 
-## Ordinary Coolify auto-deploy
+## Endpoints (edge mode)
 
-Use the existing Coolify GitHub App integration to create one application in a
-separate `wiskit-mcp-edge` project, production environment. Select `main`, base
-directory `/`, Docker Compose build pack and `/compose.yaml`. Coolify clones the
-repository and builds the root Dockerfile itself. There is no separate image
-registry, GitHub Actions deployment credential or custom management connector.
+| Route | Purpose |
+|---|---|
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 issuer metadata |
+| `GET /.well-known/oauth-protected-resource/<backend>/mcp` | RFC 9728 resource metadata |
+| `GET /.well-known/edge-assertion-key` | Public Ed25519 key backends verify assertions with |
+| `POST /register` | RFC 7591 DCR, public clients, allowlisted redirect URIs only |
+| `GET /authorize` → `GET/POST /consent` | Authorization request → passkey proof → consent |
+| `POST /token`, `POST /revoke` | Code / refresh exchange; RFC 7009 revocation |
+| `GET /owner`, `GET /owner/enroll` | Owner grant list (revoke / revoke all, add passkey); first-passkey enrollment |
+| `POST /owner/{login,register}/{start,finish}` | WebAuthn ceremonies (JSON, same-origin) |
+| `POST /<backend>/mcp` | Authenticated MCP (JSON-RPC, JSON responses); `GET` and other methods → 405 |
+| `GET /healthz`, `GET /readyz` | Process liveness; store readiness |
 
-The initial Compose runtime is unprivileged and read-only, drops capabilities,
-limits CPU/memory/PIDs, and uses `network_mode: none`. No ports, volumes or public
-domains are configured. Its binary checks its own container loopback health.
-The Docker build fetches locked public dependencies, then tests/builds offline.
-Linux container compilation and real Coolify deployment remain unverified.
+Missing or invalid bearer tokens get `401` with
+`WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource/<backend>/mcp"`.
+The `echo` backend verifies the forwarded `Edge-Assertion` like any backend would
+and exposes one tool, `whoami`, returning the verified claims.
 
-The prepared [owner-run API helper](tools/owner-coolify-repo.ps1) defaults to
-read-only inspection. It can prepare a new unstarted GitHub-App-backed
-application with auto-deploy initially disabled. Actual generated configuration
-must be verified once before enabling auto-deploy and starting the first build.
-After that, authorized pushes/merges to `main` trigger ordinary Coolify deploys;
-the owner does not repeat API setup for each release.
+## Configuration
 
-Read [Coolify setup details](docs/COOLIFY.md) for the one-time flow, exact API
-payload and unresolved target prerequisites. The older inline Compose service
-package remains separate; this repository uses a normal **Git-backed application**.
+| Variable | Default | Meaning |
+|---|---|---|
+| `EDGE_MODE` | `deny-all` | `edge` runs the authorization server and built-in backends |
+| `EDGE_PUBLIC_URL` | (required in edge mode) | Issuer and public origin, e.g. `https://mcp.app.stri.nz`; https only (http only for `localhost`), no path or trailing slash |
+| `EDGE_BIND` | `0.0.0.0:8080` | Listener; `--healthcheck` probes `127.0.0.1:<port>` |
+| `EDGE_DATA_DIR` | `/data` | Holds `edge.db` (SQLite) and `assertion-key.bin` (Ed25519 seed, created on first start, never silently replaced) |
+| `EDGE_ROUTES` | `/etc/mcp-edge/routes.toml` | Route table ([config/routes.toml](config/routes.toml) is baked into the image) |
+| `EDGE_ENROLL_CODE` | unset | One-time code (≥ 16 ASCII chars) authorizing the **first** owner passkey. Consumed on use; remove it afterwards |
+| `EDGE_REDIRECT_ALLOWLIST` | `https://claude.ai/api/mcp/auth_callback` | Comma-separated exact https redirect URIs clients may register |
+| `EDGE_TRUST_FORWARDED_FOR` | `0` | `1` = use the right-most `X-Forwarded-For` entry (the proxy's view) for per-IP limits. Only behind Traefik |
+| `EDGE_RP_ID` | public host | WebAuthn RP id (the host or a parent domain) |
+| `EDGE_RP_NAME` | `mcp-edge` | WebAuthn RP display name |
+
+Route table entries: `id` (lowercase path segment, also the assertion audience),
+`kind = "echo"`, `consent = "edge"`, `display_name`, `scopes` (default `["mcp"]`),
+`grant_lifetime_secs` (300 s – 90 days, default 30 days), `max_request_bytes`
+(1 KiB – 4 MiB, default 1 MiB). Unknown keys and reserved ids are startup errors.
+
+Fixed policy: codes 60 s; access tokens 15 min; pending authorization 10 min;
+passkey proof must be < 5 min old at approval; owner sessions 30 min. Logs are one
+line per request (`method`, route template, `status`, `ms`, `backend`, `grant`) plus
+named events; never bodies, headers, tokens, codes, cookies or the enrollment code.
+
+## Deployment steps (owner; not performed)
+
+1. Generate an enrollment code (e.g. 32 random characters) and keep it private.
+2. Create the Coolify application as described in [docs/COOLIFY.md](docs/COOLIFY.md)
+   (Docker Compose build pack, `/compose.yaml`). Note: the prepared owner helper still
+   creates the application with **no domain**; phase 2 needs one (step 3).
+3. In Coolify, set the domain of service `edge` to `https://mcp.app.stri.nz:8080`
+   (Traefik terminates TLS with Let's Encrypt and routes to container port 8080).
+4. Set `EDGE_ENROLL_CODE` as a secret environment variable. Leave
+   `EDGE_PUBLIC_URL` at its default unless the host differs.
+5. Deploy. Check `https://mcp.app.stri.nz/healthz` and `/readyz`, and note the
+   `assertion_key=` value in the startup log (also at `/.well-known/edge-assertion-key`).
+6. Open `https://mcp.app.stri.nz/owner/enroll`, enter the code, create the passkey.
+   Then remove `EDGE_ENROLL_CODE` from Coolify and redeploy (the code is consumed
+   either way; removing it keeps it out of the environment).
+7. In claude.ai add a custom connector with URL `https://mcp.app.stri.nz/echo/mcp`.
+   Claude registers, the browser lands on the consent page: confirm with the passkey,
+   approve, then call the `whoami` tool. Revoke from `https://mcp.app.stri.nz/owner`.
+
+The `edge-data` volume holds the grant store and the assertion signing key; back it
+up if grants should survive a rebuilt volume. Losing it revokes everything and
+requires a new `EDGE_ENROLL_CODE` enrollment and a new key for backends.
 
 ## Local checks
 
 ```powershell
-cargo test --locked --offline
-cargo clippy --locked --offline --all-targets -- -D warnings
-cargo fmt -- --check
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 python tools/verify_repo.py
 ```
 
-The HTTP tests bind ephemeral loopback sockets. Do not launch the root binary's
-container `main` on a host-wide interface for testing. Read each fixture README
-before running it. No Wiskit checkout, real peers, family data, shared service or
-mailbox was used or changed in this package.
+`webauthn-rs` links OpenSSL. On Windows point `OPENSSL_DIR` at an OpenSSL 3
+installation with MSVC import libraries (any directory with `include\openssl` and
+`lib\libssl.lib`/`libcrypto.lib`) and make its DLLs reachable on `PATH`. The Docker
+build links OpenSSL statically from Alpine packages.
 
-The offline package check uses PyYAML and verifies the inert Compose policy and
-all archived fixture hashes. See [verification limits](docs/VERIFICATION.md).
+The integration tests bind ephemeral loopback sockets, drive real WebAuthn
+ceremonies with a software passkey, and use a manual clock for expiry rules. Do not
+launch the binary on a host-wide interface for testing. A Windows run is not a Linux
+image build or proof of claude.ai compatibility.
+
+## Fixtures and older evidence
+
+`fixtures/iroh-transport-poc/` (12 passing transport tests) and
+`fixtures/claude-compat/` (14 synthetic OAuth/MCP policy tests) are unchanged
+byte-for-byte; they are starting points for later phases, not packaged runtime.
+`MANIFEST-SHA256.json` and `docs/VERIFICATION.md` describe the original preparatory
+package (deny-all only); phase 2 results are in DESIGN.md's implementation notes.
