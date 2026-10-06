@@ -8,17 +8,19 @@ holds its safety rules and Wiskit details.
 
 Local Wiskit use, peer sync and data recovery must remain independent of the edge.
 
-## Status: phase 2 (auth + echo), deployable but not deployed
+## Status: phase 2 live (auth + echo); phase 3 (HTTP backends) implemented, no backend enabled
 
 | Piece | State |
 |---|---|
 | `crates/edge-assert` | Signed, request-bound Ed25519 assertions; mint + verify + replay cache. Format spec and test vector in [its README](crates/edge-assert/README.md). |
 | `crates/edge-auth` | OAuth 2.1 authorization server: RFC 8414/9728 metadata, RFC 7591 public-client DCR, S256 PKCE, passkey (WebAuthn) owner proof, consent, one-use codes, rotating refresh with family revocation, RFC 7009 revocation, owner grant page, SQLite store. |
-| `mcp-edge` (root binary) | `EDGE_MODE=edge`: the above plus a closed route table whose only backend kind is the built-in `echo`. `EDGE_MODE=deny-all` (the default when unset): the original inert process. |
-| iroh tunnel / origin / HTTP backends | Not implemented (phases 3–4). `kind = "http"`, `kind = "iroh"` and `consent = "origin"` are refused at startup. |
+| `mcp-edge` (root binary) | `EDGE_MODE=edge`: the above plus a closed route table with the built-in `echo` backend and `kind = "http"` upstreams (phase 3 forwarder, `src/forward.rs`). `EDGE_MODE=deny-all` (the default when unset): the original inert process. |
+| HTTP backends | Implemented and tested against a verifying loopback upstream; the shipped route table enables none (see [Adding an HTTP backend](#adding-an-http-backend)). |
+| iroh tunnel / origin consent | Not implemented (phase 4). `kind = "iroh"` and `consent = "origin"` are refused at startup. |
 
-No Coolify resource, domain or deployment was created. Linux container build and a
-real claude.ai connector run are **unverified** (see [phase 2 notes](docs/DESIGN.md#phase-2-implementation-notes)).
+Phase 2 is deployed at `https://mcp.app.stri.nz` from `main`. The phase 3 forwarder
+has only been run on Windows against loopback upstreams; a Linux image build and a
+real upstream (hevy) are **unverified** (see [phase 3 notes](docs/DESIGN.md#phase-3-implementation-notes)).
 
 ## Endpoints (edge mode)
 
@@ -32,7 +34,8 @@ real claude.ai connector run are **unverified** (see [phase 2 notes](docs/DESIGN
 | `POST /token`, `POST /revoke` | Code / refresh exchange; RFC 7009 revocation |
 | `GET /owner`, `GET /owner/enroll` | Owner grant list (revoke / revoke all, add passkey); first-passkey enrollment |
 | `POST /owner/{login,register}/{start,finish}` | WebAuthn ceremonies (JSON, same-origin) |
-| `POST /<backend>/mcp` | Authenticated MCP (JSON-RPC, JSON responses); `GET` and other methods → 405 |
+| `POST /<backend>/mcp` | Authenticated MCP. `echo`: POST only (JSON); other methods → 405 |
+| `GET`/`POST`/`DELETE /<backend>/mcp` | `kind = "http"` backends: Streamable HTTP (JSON or SSE responses, `GET` server stream, `DELETE` session end); other methods → 405 |
 | `GET /healthz`, `GET /readyz` | Process liveness; store readiness |
 
 Missing or invalid bearer tokens get `401` with
@@ -56,9 +59,80 @@ and exposes one tool, `whoami`, returning the verified claims.
 | `EDGE_RP_NAME` | `mcp-edge` | WebAuthn RP display name |
 
 Route table entries: `id` (lowercase path segment, also the assertion audience),
-`kind = "echo"`, `consent = "edge"`, `display_name`, `scopes` (default `["mcp"]`),
-`grant_lifetime_secs` (300 s – 90 days, default 30 days), `max_request_bytes`
-(1 KiB – 4 MiB, default 1 MiB). Unknown keys and reserved ids are startup errors.
+`kind = "echo"` or `"http"`, `consent = "edge"`, `display_name`, `scopes` (default
+`["mcp"]`), `grant_lifetime_secs` (300 s – 90 days, default 30 days),
+`max_request_bytes` (1 KiB – 4 MiB, default 1 MiB). Unknown keys and reserved ids
+are startup errors.
+
+`kind = "http"` only (these keys on an `echo` entry are errors):
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `url` | required | | Exact upstream MCP endpoint. `https` to any host; `http` only to an RFC 1918/loopback IP or a single-label service name (e.g. `http://hevy-mcp:3000/mcp` on the Coolify network). No userinfo, query or fragment; never unspecified, link-local, multicast or broadcast IPs; must be written in canonical form (lowercase host, no default port, a path). Its path is what the upstream receives and what `req` signs. |
+| `max_response_bytes` | 4 MiB | 1 KiB – 16 MiB | Response body cap (streams included) |
+| `connect_timeout_secs` | 5 | 1 – 30 | TCP/TLS connect |
+| `response_timeout_secs` | 20 | 1 – 25 | Time to the upstream's response headers (stays under the edge's 30 s request deadline) |
+| `idle_timeout_secs` | 60 | 1 – 300 | Longest gap between response body chunks |
+| `max_concurrent_per_grant` | 4 | 1 – 64 | In-flight requests plus open streams per grant on this backend |
+
+### HTTP backend behaviour
+
+- A method other than `GET`, `POST` or `DELETE` is a 405 before anything else.
+  Then the bearer token is checked exactly as for `echo` (it must be bound to this
+  backend), before any body is read. `POST` needs `Content-Type: application/json`;
+  `GET`/`DELETE` must have no body (400).
+- The upstream request is built from scratch: the configured URL (the client's path
+  and query never reach it), the client's method, the exact body bytes (never
+  re-serialised), and only these request headers, each at most once and at most
+  1 KiB of visible ASCII (otherwise 400): `content-type`, `accept`,
+  `mcp-session-id`, `mcp-protocol-version`, `last-event-id`. `Authorization`,
+  `Cookie`, `Host`, `Forwarded`, `X-Forwarded-*`, `Accept-Encoding` and any client
+  `Edge-Assertion` are dropped. The edge adds its own `Edge-Assertion` (aud =
+  backend id, `req` over method, upstream path and body). The HTTP client also sends
+  `Host` (the upstream's), `Content-Length`, and `Accept: */*` when the client sent
+  no `Accept`. No compression, HTTP/1.1, no proxies, redirects never followed; TLS
+  via rustls with the webpki root set.
+- The response keeps its status and only `content-type`, `mcp-session-id` and
+  `cache-control` (`no-store` if absent). The body is streamed as it arrives (SSE
+  events are not buffered) and aborted when it passes `max_response_bytes`, stalls
+  longer than `idle_timeout_secs`, or runs past 300 s; an aborted body ends without
+  the chunked terminator, so the client sees a truncated response, never a
+  complete-looking one.
+- Fixed errors (JSON `{"error": ...}`): upstream 3xx → 502 `upstream_redirect`
+  (no `Location`); upstream 401 → 502 `backend_rejected` (the upstream refused the
+  edge's assertion; its `WWW-Authenticate` is never passed on); connection failure
+  (refused, DNS, TLS, connect timeout) → 502 `upstream_unavailable`; no response
+  headers within `response_timeout_secs` → 504 `upstream_timeout`; declared length
+  over the cap → 502 `upstream_response_too_large`; per-grant in-flight cap → 429
+  `too_many_in_flight`. Other statuses (including 404 for an expired MCP session)
+  pass through.
+- Logs: the usual request line plus `event=upstream_*` /
+  `backend_rejected_assertion` with backend and grant id; never URLs, headers,
+  bodies, session ids or tokens.
+
+### Adding an HTTP backend
+
+1. Make the upstream verify `Edge-Assertion` per
+   [the edge-assert spec](crates/edge-assert/README.md): the edge public key from
+   `/.well-known/edge-assertion-key`, issuer `https://mcp.app.stri.nz`, audience =
+   the route `id`, and `req` over the method, the exact path of the configured URL
+   and the raw body. It must drop its own OAuth and reject requests without a valid
+   assertion (its 401 shows up as 502 `backend_rejected`).
+2. Add an entry to `config/routes.toml` (the same example is there, commented out):
+
+   ```toml
+   [[backend]]
+   id = "hevy"
+   kind = "http"
+   consent = "edge"
+   display_name = "Hevy"
+   url = "https://hevy-mcp.app.stri.nz/mcp"
+   ```
+
+   Prefer an internal URL (`http://<service>:<port>/mcp` on a network shared with
+   the edge) once the upstream no longer needs to be public.
+3. Merging to `main` deploys. In claude.ai add a connector for
+   `https://mcp.app.stri.nz/hevy/mcp`; then remove the upstream's public route.
 
 Fixed policy: codes 60 s; access tokens 15 min; pending authorization 10 min;
 passkey proof must be < 5 min old at approval; owner sessions 30 min. Logs are one

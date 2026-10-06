@@ -6,6 +6,7 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    time::Duration,
 };
 
 /// Path segments that can never be backend ids.
@@ -25,6 +26,17 @@ const RESERVED: &[&str] = &[
 const MAX_BACKENDS: usize = 32;
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESPONSE_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Time to the upstream's response headers. Must stay below the edge's
+/// 30 s request deadline (which covers authentication and the request body).
+pub const DEFAULT_RESPONSE_TIMEOUT_SECS: u64 = 20;
+const MAX_RESPONSE_TIMEOUT_SECS: u64 = 25;
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60;
+const MAX_IDLE_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_MAX_CONCURRENT_PER_GRANT: usize = 4;
+const MAX_CONCURRENT_PER_GRANT_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(pub String);
@@ -40,11 +52,28 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
     Err(ConfigError(msg.into()))
 }
 
-/// What serves a route. Phase 2 only has the built-in echo backend; `http`
-/// and `iroh` kinds are rejected until their phases land.
+/// What serves a route: the built-in echo backend or an HTTP upstream fixed
+/// in the route table. `iroh` is rejected until its phase lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteKind {
     Echo,
+    Http,
+}
+
+/// Settings of a `kind = "http"` backend. The upstream URL comes only from
+/// the route table; nothing in a request can change it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpUpstream {
+    /// The exact upstream MCP endpoint (canonical form, no query/fragment/userinfo).
+    pub url: url::Url,
+    pub max_response_bytes: usize,
+    pub connect_timeout: Duration,
+    /// Time to first byte (the upstream's response headers).
+    pub response_timeout: Duration,
+    /// Longest gap between response body chunks (SSE streams included).
+    pub idle_timeout: Duration,
+    /// Requests (including open streams) one grant may have in flight here.
+    pub max_concurrent_per_grant: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +84,8 @@ pub struct Route {
     pub scopes: Vec<String>,
     pub grant_lifetime_secs: i64,
     pub max_request_bytes: usize,
+    /// Present exactly when `kind == RouteKind::Http`.
+    pub http: Option<HttpUpstream>,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +110,195 @@ struct BackendEntry {
     grant_lifetime_secs: Option<i64>,
     #[serde(default)]
     max_request_bytes: Option<usize>,
+    // kind = "http" only:
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    max_response_bytes: Option<usize>,
+    #[serde(default)]
+    connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    response_timeout_secs: Option<u64>,
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_concurrent_per_grant: Option<usize>,
+}
+
+impl BackendEntry {
+    fn has_http_keys(&self) -> bool {
+        self.url.is_some()
+            || self.max_response_bytes.is_some()
+            || self.connect_timeout_secs.is_some()
+            || self.response_timeout_secs.is_some()
+            || self.idle_timeout_secs.is_some()
+            || self.max_concurrent_per_grant.is_some()
+    }
+}
+
+fn private_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+fn never_a_backend(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_unspecified() || v4.is_link_local() || v4.is_multicast() || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local (incl. cloud metadata over IPv6).
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| never_a_backend(IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// A single DNS label, e.g. a Docker service/container name (`hevy-mcp`).
+fn single_label(host: &str) -> bool {
+    let b = host.as_bytes();
+    (1..=63).contains(&b.len())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[0] != b'-'
+        && b[b.len() - 1] != b'-'
+        && !b.iter().all(u8::is_ascii_digit)
+}
+
+/// Validate an upstream URL from the route table.
+///
+/// * `https` to any host, or `http` only to an RFC 1918 / loopback IP or a
+///   single-label name (a service on the container network);
+/// * no userinfo, query or fragment; never unspecified, link-local,
+///   multicast or broadcast IPs; port 0 refused;
+/// * the text must already be in canonical form (what the forwarder will
+///   send and sign), so the configured string *is* the upstream request.
+pub fn validate_upstream_url(text: &str) -> Result<url::Url, String> {
+    if text
+        .bytes()
+        .any(|c| c.is_ascii_whitespace() || c.is_ascii_control())
+    {
+        return Err("url must not contain whitespace or control characters".into());
+    }
+    let url = url::Url::parse(text).map_err(|_| "url is not a valid URL".to_string())?;
+    let https = match url.scheme() {
+        "https" => true,
+        "http" => false,
+        _ => return Err("url scheme must be https (or http on a private network)".into()),
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("url must not contain userinfo".into());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("url must not contain a query or fragment".into());
+    }
+    if url.cannot_be_a_base() || !url.path().starts_with('/') {
+        return Err("url must have an absolute path".into());
+    }
+    if url.port() == Some(0) {
+        return Err("url port must not be 0".into());
+    }
+    let ip = match url.host() {
+        Some(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
+        Some(url::Host::Domain(_)) => None,
+        None => return Err("url must name a host".into()),
+    };
+    if ip.is_some_and(never_a_backend) {
+        return Err(
+            "url host is an unspecified, link-local, multicast or broadcast address".into(),
+        );
+    }
+    if !https {
+        let ok = match (ip, url.host_str()) {
+            (Some(ip), _) => private_or_loopback(ip),
+            (None, Some(host)) => single_label(host),
+            _ => false,
+        };
+        if !ok {
+            return Err(
+                "plain http is only allowed to an RFC 1918/loopback IP or a single-label \
+                 service name; use https"
+                    .into(),
+            );
+        }
+    }
+    if url.as_str() != text {
+        return Err(format!(
+            "url must be written in canonical form: {}",
+            url.as_str()
+        ));
+    }
+    Ok(url)
+}
+
+fn secs(
+    value: Option<u64>,
+    default: u64,
+    max: u64,
+    what: &str,
+    id: &str,
+) -> Result<Duration, ConfigError> {
+    let v = value.unwrap_or(default);
+    if !(1..=max).contains(&v) {
+        return err(format!("backend {id:?}: {what} must be 1..={max}"));
+    }
+    Ok(Duration::from_secs(v))
+}
+
+fn http_upstream(b: &BackendEntry) -> Result<HttpUpstream, ConfigError> {
+    let id = &b.id;
+    let Some(text) = b.url.as_deref() else {
+        return err(format!("backend {id:?}: kind = \"http\" needs url"));
+    };
+    let url =
+        validate_upstream_url(text).map_err(|e| ConfigError(format!("backend {id:?}: {e}")))?;
+    let max_response_bytes = b.max_response_bytes.unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
+    if !(1024..=MAX_RESPONSE_BYTES_LIMIT).contains(&max_response_bytes) {
+        return err(format!(
+            "backend {id:?}: max_response_bytes must be 1024..={MAX_RESPONSE_BYTES_LIMIT}"
+        ));
+    }
+    let max_concurrent_per_grant = b
+        .max_concurrent_per_grant
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_PER_GRANT);
+    if !(1..=MAX_CONCURRENT_PER_GRANT_LIMIT).contains(&max_concurrent_per_grant) {
+        return err(format!(
+            "backend {id:?}: max_concurrent_per_grant must be 1..={MAX_CONCURRENT_PER_GRANT_LIMIT}"
+        ));
+    }
+    Ok(HttpUpstream {
+        url,
+        max_response_bytes,
+        connect_timeout: secs(
+            b.connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+            30,
+            "connect_timeout_secs",
+            id,
+        )?,
+        response_timeout: secs(
+            b.response_timeout_secs,
+            DEFAULT_RESPONSE_TIMEOUT_SECS,
+            MAX_RESPONSE_TIMEOUT_SECS,
+            "response_timeout_secs",
+            id,
+        )?,
+        idle_timeout: secs(
+            b.idle_timeout_secs,
+            DEFAULT_IDLE_TIMEOUT_SECS,
+            MAX_IDLE_TIMEOUT_SECS,
+            "idle_timeout_secs",
+            id,
+        )?,
+        max_concurrent_per_grant,
+    })
 }
 
 fn valid_id(id: &str) -> bool {
@@ -113,7 +333,8 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
         }
         let kind = match b.kind.as_str() {
             "echo" => RouteKind::Echo,
-            "http" | "iroh" => {
+            "http" => RouteKind::Http,
+            "iroh" => {
                 return err(format!(
                     "backend {:?}: kind {:?} is not available in this phase",
                     b.id, b.kind
@@ -131,7 +352,7 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
             }
             Some(other) => return err(format!("backend {:?}: unknown consent {other:?}", b.id)),
         }
-        let scopes = b.scopes.unwrap_or_else(|| vec!["mcp".into()]);
+        let scopes = b.scopes.clone().unwrap_or_else(|| vec!["mcp".into()]);
         if scopes.is_empty() || scopes.len() > 16 || !scopes.iter().all(|s| valid_scope(s)) {
             return err(format!("backend {:?}: invalid scopes", b.id));
         }
@@ -149,6 +370,18 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
                 b.id
             ));
         }
+        let http = match kind {
+            RouteKind::Http => Some(http_upstream(&b)?),
+            RouteKind::Echo => {
+                if b.has_http_keys() {
+                    return err(format!(
+                        "backend {:?}: url and upstream limits are only valid for kind = \"http\"",
+                        b.id
+                    ));
+                }
+                None
+            }
+        };
         let display_name = b
             .display_name
             .map(|n| n.chars().filter(|c| !c.is_control()).take(80).collect())
@@ -160,6 +393,7 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
             scopes,
             grant_lifetime_secs: lifetime,
             max_request_bytes,
+            http,
         });
     }
     Ok(routes)
@@ -425,6 +659,143 @@ display_name = "Echo"
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].id, "echo");
         assert_eq!(routes[0].kind, RouteKind::Echo);
+        // The commented-out http example is valid once uncommented.
+        let shipped = include_str!("../config/routes.toml");
+        let start = shipped.find("# [[backend]]").unwrap();
+        let example: String = shipped[start..]
+            .lines()
+            .map(|l| l.strip_prefix("# ").unwrap_or(l))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let routes = parse_routes(&format!("{}{example}", &shipped[..start])).unwrap();
+        assert_eq!(routes.len(), 2);
+        let hevy = &routes[1];
+        assert_eq!((hevy.id.as_str(), hevy.kind), ("hevy", RouteKind::Http));
+        assert_eq!(
+            hevy.http.as_ref().unwrap().url.as_str(),
+            "https://hevy-mcp.app.stri.nz/mcp"
+        );
+    }
+
+    fn http_route(extra: &str) -> Result<Vec<Route>, ConfigError> {
+        parse_routes(&format!(
+            "[[backend]]\nid = \"up\"\nkind = \"http\"\nconsent = \"edge\"\n{extra}\n"
+        ))
+    }
+
+    #[test]
+    fn http_backend_defaults_and_limits() {
+        let routes = http_route("url = \"http://hevy-mcp:3000/mcp\"").unwrap();
+        let r = &routes[0];
+        assert_eq!(r.kind, RouteKind::Http);
+        let h = r.http.as_ref().unwrap();
+        assert_eq!(h.url.as_str(), "http://hevy-mcp:3000/mcp");
+        assert_eq!(h.max_response_bytes, DEFAULT_MAX_RESPONSE_BYTES);
+        assert_eq!(
+            h.connect_timeout,
+            Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            h.response_timeout,
+            Duration::from_secs(DEFAULT_RESPONSE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            h.idle_timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(h.max_concurrent_per_grant, DEFAULT_MAX_CONCURRENT_PER_GRANT);
+        assert_eq!(r.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+
+        let routes = http_route(
+            "url = \"https://mcp.example.com/v1/mcp\"\nmax_request_bytes = 2048\n\
+             max_response_bytes = 8192\nconnect_timeout_secs = 2\nresponse_timeout_secs = 3\n\
+             idle_timeout_secs = 4\nmax_concurrent_per_grant = 2",
+        )
+        .unwrap();
+        let h = routes[0].http.as_ref().unwrap();
+        assert_eq!(
+            (
+                h.max_response_bytes,
+                h.connect_timeout.as_secs(),
+                h.response_timeout.as_secs()
+            ),
+            (8192, 2, 3)
+        );
+        assert_eq!(
+            (h.idle_timeout.as_secs(), h.max_concurrent_per_grant),
+            (4, 2)
+        );
+        assert_eq!(routes[0].max_request_bytes, 2048);
+
+        for bad in [
+            "", // url missing
+            "url = \"http://hevy-mcp/mcp\"\nmax_response_bytes = 10",
+            "url = \"http://hevy-mcp/mcp\"\nmax_response_bytes = 999999999",
+            "url = \"http://hevy-mcp/mcp\"\nconnect_timeout_secs = 0",
+            "url = \"http://hevy-mcp/mcp\"\nresponse_timeout_secs = 30",
+            "url = \"http://hevy-mcp/mcp\"\nidle_timeout_secs = 0",
+            "url = \"http://hevy-mcp/mcp\"\nmax_concurrent_per_grant = 0",
+            "url = \"http://hevy-mcp/mcp\"\nheaders = { x = \"y\" }", // unknown key
+        ] {
+            assert!(http_route(bad).is_err(), "{bad}");
+        }
+        assert!(parse_routes(
+            "[[backend]]\nid = \"up\"\nkind = \"http\"\nconsent = \"origin\"\nurl = \"http://hevy-mcp/mcp\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn upstream_url_policy() {
+        for ok in [
+            "http://hevy-mcp:3000/mcp",
+            "http://localhost:8080/mcp",
+            "http://10.0.1.5:3000/mcp",
+            "http://172.20.0.3/mcp",
+            "http://192.168.1.10:9000/mcp",
+            "http://127.0.0.1:41000/x/mcp",
+            "http://[::1]:41000/mcp",
+            "https://mcp.example.com/mcp",
+            "https://203.0.113.10:8443/mcp",
+            "https://hevy-mcp/mcp",
+        ] {
+            assert!(validate_upstream_url(ok).is_ok(), "{ok}");
+        }
+        // The planned hevy route: the signed path is exactly `/mcp`, and
+        // `/mcp/` stays a different (also exact) upstream path.
+        let hevy = validate_upstream_url("https://hevy-mcp.app.stri.nz/mcp").unwrap();
+        assert_eq!(hevy.path(), "/mcp");
+        let slash = validate_upstream_url("https://hevy-mcp.app.stri.nz/mcp/").unwrap();
+        assert_eq!(slash.path(), "/mcp/");
+        for bad in [
+            "http://mcp.example.com/mcp", // public name over plain http
+            "http://hevy.internal/mcp",   // multi-label name over plain http
+            "http://203.0.113.10/mcp",    // public IP over plain http
+            "http://8.8.8.8/mcp",
+            "http://[fd00::1]/mcp",          // ULA not allowed for plain http
+            "http://169.254.169.254/latest", // link-local / metadata
+            "https://169.254.169.254/x",
+            "https://0.0.0.0/mcp",
+            "http://[fe80::1]/mcp",
+            "https://224.0.0.1/mcp",
+            "ftp://10.0.0.1/mcp",
+            "file:///etc/passwd",
+            "https://user:pw@mcp.example.com/mcp",
+            "https://mcp.example.com/mcp?key=1",
+            "https://mcp.example.com/mcp#x",
+            "https://mcp.example.com:0/mcp",
+            "https://MCP.example.com/mcp", // not canonical
+            "https://mcp.example.com",     // not canonical (no path)
+            "http://hevy-mcp:80/mcp",      // not canonical (default port)
+            "http://hevy-mcp/a/../mcp",    // not canonical (dot segment)
+            "http://hevy-mcp/mcp ",
+            "http://hevy\n-mcp/mcp",
+            "http://-bad-/mcp",
+            "not a url",
+            "",
+        ] {
+            assert!(validate_upstream_url(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -433,8 +804,10 @@ display_name = "Echo"
         assert_eq!(routes[0].id, "echo");
         assert_eq!(routes[0].scopes, vec!["mcp"]);
         assert_eq!(routes[0].max_request_bytes, DEFAULT_MAX_REQUEST_BYTES);
+        assert!(routes[0].http.is_none());
         for bad in [
             "[[backend]]\nid = \"x\"\nkind = \"http\"\n",
+            "[[backend]]\nid = \"x\"\nkind = \"echo\"\nmax_response_bytes = 4096\n",
             "[[backend]]\nid = \"x\"\nkind = \"iroh\"\n",
             "[[backend]]\nid = \"x\"\nkind = \"echo\"\nconsent = \"origin\"\n",
             "[[backend]]\nid = \"x\"\nkind = \"echo\"\nurl = \"http://10.0.0.1\"\n",

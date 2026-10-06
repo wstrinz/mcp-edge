@@ -242,9 +242,10 @@ below was taken.
   existing file of the wrong size stops startup instead of being replaced. Rotation is manual
   (delete the file, update backends). Backends get the key from
   `/.well-known/edge-assertion-key` or the startup log, configured out of band.
-- For phase 3 (noted as a TODO at the dispatch point in `src/app.rs`): the HTTP
-  forwarder must build upstream requests from scratch, strip any client-supplied
-  `Edge-Assertion` header, and sign exactly the path and body it forwards.
+- For phase 3 (L5, formerly a TODO at the dispatch point in `src/app.rs`): the
+  HTTP forwarder must build upstream requests from scratch, strip any
+  client-supplied `Edge-Assertion` header, and sign exactly the path and body it
+  forwards. **Resolved in phase 3**, see below.
 
 **Transport and limits**
 - MCP is stateless JSON (no `Mcp-Session-Id`, no SSE). `initialize` negotiates
@@ -271,7 +272,7 @@ below was taken.
   first. Pending authorization requests are capped at 4 unverified per network and
   4096 overall; only unverified ones are ever evicted (oldest first), never one with a
   passkey proof. Displacing the owner's in-progress state needs thousands of networks. A response cap is not needed for the in-binary echo and
-  belongs to the HTTP forwarder in phase 3.
+  belongs to the HTTP forwarder (done in phase 3).
 - Client IP is the TCP peer. Only when the peer is inside `EDGE_TRUSTED_PROXIES`
   (default RFC 1918, loopback and `fc00::/7`, since only Coolify's Traefik can reach
   the container) is `X-Forwarded-For` read, taking the right-most hop that is not a
@@ -306,3 +307,118 @@ odd-path requests are already covered.
 - The prepared owner Coolify helper still creates the application with no domain and
   an "inert" description; phase 2 needs the domain set (see README).
 - Backup policy for the `edge-data` volume (grants and the assertion key).
+
+## Phase 3 implementation notes
+
+Status 2026-10-06, branch `phase3-http` (not merged, not deployed): `kind = "http"`
+backends with `consent = "edge"` are implemented in `src/config.rs` (route keys and
+URL policy), `src/forward.rs` (the forwarder) and `src/app.rs` (dispatch), and tested
+on Windows against a fake upstream on loopback that verifies every assertion with
+`edge-assert` (`tests/http_backend.rs`). The shipped route table enables no http
+backend; the README documents how to add one (hevy as the example). Not done: a
+Linux image build with the new TLS dependencies, a real upstream (hevy) behind the
+edge, removing hevy's public route (the phase 3 acceptance items). There is no
+separate `edge-gateway` crate yet; the forwarder lives in the binary until a second
+consumer exists (phase 5).
+
+**Routing and admission**
+- Public surface per backend stays `<prefix>/mcp`, now one handler for all methods.
+  Order: unknown backend → 404; a method the backend kind does not serve → 405
+  with `Allow` (echo: `POST`; http: `GET, POST, DELETE`) before authentication,
+  as echo already did; then the bearer token bound to this backend (before any
+  body is read); then the per-grant rate limit; then kind-specific checks.
+- `POST` needs `application/json`; `GET` and `DELETE` must arrive without a body
+  (400 rather than silently dropping one); bodies are capped by
+  `max_request_bytes` and read within the edge's 30 s request deadline.
+- `max_concurrent_per_grant` (default 4) counts in-flight requests *and* open
+  response streams per grant per backend (429 `too_many_in_flight`); the slot is
+  released when the response body ends, fails or the client disconnects. The
+  per-network in-flight limit (8) only covers the time to response headers, so a
+  long SSE stream does not hold it; streams are bounded per grant instead.
+- `MCP-Protocol-Version` is passed through, not checked against echo's list (the
+  upstream negotiates its own revisions); it only has to pass the header rules.
+
+**Upstream request (built from scratch, L5 resolved)**
+- URL from the route table only. `https` to any host; `http` only to an RFC 1918
+  or loopback IP (IPv4, or `::1`) or a single-label name (a container/service on a
+  shared network). IPv6 ULA is not accepted for `http` (conservative; Coolify
+  networks are IPv4). Never unspecified, link-local (incl. `169.254.169.254`),
+  multicast or broadcast IPs; no userinfo, query or fragment; port 0 refused. The
+  configured text must already be canonical (what `url` would serialise), so the
+  string in the config is byte-for-byte the request target and the signed path,
+  e.g. hevy's exact `/mcp` (never `/mcp/` or `/MCP`). DNS for names is resolved at
+  request time by the system resolver; the edge does not re-check resolved
+  addresses (the name is owner-configured, not request-controlled).
+- Method as received (GET/POST/DELETE). Headers: an allowlist of `content-type`,
+  `accept`, `mcp-session-id`, `mcp-protocol-version`, `last-event-id`, each
+  forwarded unchanged if present exactly once with ≤ 1 KiB of visible ASCII
+  (space allowed); a repeated or malformed allowlisted header is a 400, never
+  repaired. Everything else is dropped, including `Authorization`, `Cookie`, `Host`,
+  `Forwarded`, `X-Forwarded-*`, `Accept-Encoding` and any incoming
+  `Edge-Assertion`. The client library adds `Host` (from the configured URL),
+  `Content-Length` and `Accept: */*` if the client sent no `Accept`.
+- Body: the exact bytes received (never parsed or re-serialised for http
+  backends). `Edge-Assertion` is minted per request with aud = backend id and
+  `req` over (method, configured URL path, body); GET/DELETE sign an empty body.
+- Client: reqwest 0.12 with rustls (ring) and the webpki root set, HTTP/1.1 only,
+  TLS ≥ 1.2, `no_proxy()` (environment proxies ignored), redirect policy none, no
+  compression features (so no `Accept-Encoding` and no transparent decoding: the
+  upstream sees the raw bytes `req` covers), connect timeout per backend, idle
+  pooled connections kept 60 s.
+
+**Upstream response**
+- Status passes through, except: 3xx → 502 `upstream_redirect` (never followed,
+  `Location` never returned); 401 → 502 `backend_rejected` (the upstream refused
+  the edge's assertion or still runs its own OAuth; passing it on would make the
+  client discard a valid token, and its `WWW-Authenticate` must not leak); 1xx →
+  502. 404 (expired MCP session) and other statuses pass through.
+- Headers: only `content-type`, `mcp-session-id`, `cache-control` (`no-store`
+  added if absent). `Set-Cookie`, `Location`, `WWW-Authenticate`,
+  `Content-Encoding` and everything else are dropped.
+- Body streamed chunk by chunk (SSE events reach the client as the upstream
+  writes them; tested by an upstream that cannot finish until the client has the
+  first event). A declared `Content-Length` over `max_response_bytes` → 502
+  `upstream_response_too_large` before any byte; a streamed body that passes the
+  cap, stalls for `idle_timeout_secs`, errors, or runs past 300 s (the server's
+  connection lifetime) is aborted: the chunked body ends without its terminator so
+  clients see truncation, never a complete-looking response. These are logged as
+  `event=upstream_response_too_large|upstream_idle_timeout|upstream_stream_deadline|
+  upstream_stream_error` with backend and grant id. The overall stream lifetime is
+  a fixed constant, not a route key.
+- Errors before the response: connection failure (refused, DNS, TLS, connect
+  timeout) → 502 `upstream_unavailable`; no response headers within
+  `response_timeout_secs` (≤ 25, below the 30 s request deadline) → 504
+  `upstream_timeout`. Bodies are fixed JSON; nothing from the upstream error is
+  echoed or logged.
+
+**Checklist coverage added**: 5 for http backends
+(`token_for_one_backend_is_rejected_at_another`), 6 at an http backend integration
+(`json_post_round_trip_binds_upstream_path_and_body`,
+`upstream_rejecting_the_assertion_is_502`), 7 (`crafted_paths_queries_and_host_headers_cannot_redirect_the_forwarder`:
+encoded slashes, dot segments, case, trailing slash, absolute-form, query,
+`Host`, `X-Forwarded-Host`, `Forwarded`), 8 for the forwarder (no token, body
+marker, session id or assertion in logs). hevy-mcp compatibility (exact `/mcp`,
+raw body, unchanged `Accept`/`Content-Type`, no `Accept-Encoding`, session id both
+ways, GET/DELETE) is `hevy_compatibility_exact_bytes_path_accept_and_session`.
+
+**Deviations from the plan above**
+- "Only `POST <prefix>/mcp` (and `GET` returning 405 for SSE until needed)": http
+  backends now also serve `GET` (SSE) and `DELETE`, as Streamable HTTP sessions
+  need them; echo is unchanged.
+- "deadlines on connect, first byte and total": the total deadline for a
+  response body is fixed at 300 s and an idle gap is configurable; first byte is
+  `response_timeout_secs`, capped at 25 s.
+- `AGENTS.md` said private-network destinations must never be accepted by fixed
+  transport operations; the route table may name an RFC 1918 or loopback upstream
+  over plain http because that is how Coolify containers reach each other. Requests
+  still cannot choose a destination.
+
+**Open questions from phase 3**
+- Should upstreams on the Coolify network be reached by internal name over http
+  (no public exposure, no TLS on the hop) or by their public https URL until moved?
+  The hevy example uses the public URL as planned.
+- Is 300 s enough for long-lived GET SSE streams? Clients reconnect with
+  `Last-Event-ID`; raising it also means raising the server's connection lifetime.
+- Should a 403 from an upstream be passed through (current) or mapped like 401?
+- Should the edge refuse names that resolve to link-local/metadata addresses at
+  request time (a DNS-level check), given names are owner-configured?

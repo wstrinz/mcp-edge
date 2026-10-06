@@ -3,9 +3,11 @@
 This repository prepares an optional HTTPS/iroh edge for Wiskit. The root
 `mcp-edge` binary runs the original deny-all process by default and, with
 `EDGE_MODE=edge`, the phase 2 OAuth authorization server (`crates/edge-auth`),
-signed assertions (`crates/edge-assert`) and only the built-in `echo` backend.
-It does not forward to any other host. Read README.md, docs/DESIGN.md (current
-plan and phase 2 notes), docs/COOLIFY.md and docs/BUILDER-HANDOFF.md first.
+signed assertions (`crates/edge-assert`), the built-in `echo` backend and
+(phase 3) `kind = "http"` backends whose upstream URLs are fixed in the route
+table (`src/forward.rs`); the shipped table enables no http backend. Read
+README.md, docs/DESIGN.md (current plan and phase 2/3 notes), docs/COOLIFY.md
+and docs/BUILDER-HANDOFF.md first.
 
 - Keep local Wiskit tracking, peer sync, export and recovery independent of this
   service. No family data, DEKs, real peer identities or credentials belong here.
