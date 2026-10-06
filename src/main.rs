@@ -119,7 +119,8 @@ async fn run_edge() {
     };
     let seed = match load_or_create_seed(&cfg.data_dir.join("assertion-key.bin")) {
         Ok(seed) => seed,
-        Err(_) => fail("assertion key unavailable (check EDGE_DATA_DIR permissions)"),
+        // io::Error text is an OS message or our fixed wrong-size message; no key material.
+        Err(e) => fail(&format!("assertion key unavailable: {e}")),
     };
     let origin = match url::Url::parse(&cfg.public_url) {
         Ok(u) => u,

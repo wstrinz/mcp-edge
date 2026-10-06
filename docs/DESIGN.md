@@ -231,7 +231,9 @@ below was taken.
   64 live pending requests. A response cap is not needed for the in-binary echo and
   belongs to the HTTP forwarder in phase 3.
 - Client IP is the TCP peer unless `EDGE_TRUST_FORWARDED_FOR=1`, then the right-most
-  `X-Forwarded-For` entry (the address Traefik saw). IPv6 is limited per /64.
+  `X-Forwarded-For` entry (the address Traefik saw). IPv6 is limited per /64. The
+  limiter holds at most 10 000 keys; when all are live, new keys are refused for the
+  rest of the window (fail closed, a bounded DoS trade-off).
 - Logs: one line per request (method, route template, status, ms, backend, grant id)
   plus named events (`consent_approved`, `refresh_reuse`, `grant_revoked`, ...). A test
   greps captured logs for every secret the flow produced.

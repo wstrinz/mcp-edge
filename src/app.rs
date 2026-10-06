@@ -320,6 +320,8 @@ fn challenge(edge: &Edge, backend: &str, error: Option<&'static str>) -> Respons
     if let Ok(v) = HeaderValue::from_str(&value) {
         res.headers_mut().insert(WWW_AUTHENTICATE, v);
     }
+    res.extensions_mut()
+        .insert(LoggedBackend(backend.to_owned()));
     res
 }
 
