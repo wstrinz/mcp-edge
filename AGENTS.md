@@ -2,7 +2,7 @@
 
 This repository prepares an optional HTTPS/iroh edge for Wiskit. The current
 deployable root crate is a deny-all HTTP process. It is not an integrated MCP
-gateway. Read README.md, docs/COOLIFY.md and docs/BUILDER-HANDOFF.md first.
+gateway. Read README.md, docs/DESIGN.md (current plan), docs/COOLIFY.md and docs/BUILDER-HANDOFF.md first.
 
 - Keep local Wiskit tracking, peer sync, export and recovery independent of this
   service. No family data, DEKs, real peer identities or credentials belong here.
