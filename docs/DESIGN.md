@@ -227,8 +227,11 @@ below was taken.
   canonical JSON (integers only); the Rust verifier rejects non-canonical payloads and
   unknown claims and allows 5 s skew. `resource_scope` is `{}` for edge-consent
   backends; `gen` starts at 1.
-- The signing seed is `EDGE_DATA_DIR/assertion-key.bin`, created on first start; a
-  file of the wrong size stops startup instead of being replaced. Rotation is manual
+- The signing seed is `EDGE_DATA_DIR/assertion-key.bin`, created on first start
+  atomically: written and fsynced to a temporary file in the same directory, then
+  hard-linked into place (never replacing an existing file), then the directory is
+  fsynced. Crash leftovers are only stray temporaries, removed on the next start; an
+  existing file of the wrong size stops startup instead of being replaced. Rotation is manual
   (delete the file, update backends). Backends get the key from
   `/.well-known/edge-assertion-key` or the startup log, configured out of band.
 

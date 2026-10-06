@@ -11,7 +11,6 @@ use mcp_edge::{
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -67,32 +66,6 @@ fn fail(message: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Load the assertion signing seed, creating it on first start. An existing
-/// file of the wrong size is never replaced silently.
-fn load_or_create_seed(path: &Path) -> std::io::Result<[u8; 32]> {
-    match std::fs::read(path) {
-        Ok(bytes) => bytes
-            .try_into()
-            .map_err(|_| std::io::Error::other("assertion key file has the wrong size")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let seed = edge_assert::Signer::generate_seed()
-                .map_err(|_| std::io::Error::other("random source unavailable"))?;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(path)?;
-            file.write_all(&seed)?;
-            file.sync_all()?;
-            Ok(seed)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 async fn run_deny_all() {
     // The isolated container listener; tests use serve() on loopback instead.
     let listener = match TcpListener::bind(DEFAULT_BIND).await {
@@ -117,7 +90,7 @@ async fn run_edge() {
         Ok(cfg) => cfg,
         Err(e) => fail(&e.to_string()),
     };
-    let seed = match load_or_create_seed(&cfg.data_dir.join("assertion-key.bin")) {
+    let seed = match mcp_edge::keyfile::load_or_create_seed(&cfg.data_dir, "assertion-key.bin") {
         Ok(seed) => seed,
         // io::Error text is an OS message or our fixed wrong-size message; no key material.
         Err(e) => fail(&format!("assertion key unavailable: {e}")),

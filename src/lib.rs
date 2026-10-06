@@ -9,6 +9,7 @@ pub mod app;
 pub mod config;
 pub mod deny_all;
 pub mod echo;
+pub mod keyfile;
 pub mod server;
 
 use std::io;
