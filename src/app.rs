@@ -4,6 +4,7 @@
 use crate::{
     config::{forwarded_client, Cidr, Route, RouteKind},
     echo::{EchoBackend, SUPPORTED_PROTOCOL_VERSIONS},
+    forward::{self, HttpBackend, Outgoing},
 };
 use axum::{
     body::{Body, Bytes},
@@ -14,7 +15,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{any, get},
     Router,
 };
 use edge_assert::{GrantContext, RequestBinding, Signer};
@@ -102,6 +103,7 @@ struct LoggedBackend(String);
 
 enum Handler {
     Echo(EchoBackend),
+    Http(HttpBackend),
 }
 
 struct Backend {
@@ -170,7 +172,16 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
                 EchoBackend::new(&public_key, &cfg.issuer, &route.id)
                     .map_err(|_| InitError::Config("assertion key"))?,
             ),
-            RouteKind::Http => return Err(InitError::Config("http backends are not wired yet")),
+            RouteKind::Http => {
+                let upstream = route
+                    .http
+                    .as_ref()
+                    .ok_or(InitError::Config("http backend without upstream"))?;
+                Handler::Http(
+                    HttpBackend::new(&route.id, upstream)
+                        .map_err(|_| InitError::Config("http client"))?,
+                )
+            }
         };
         backends.insert(
             route.id.clone(),
@@ -205,10 +216,7 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/.well-known/edge-assertion-key", get(assertion_key))
-        .route(
-            "/{backend}/mcp",
-            axum::routing::post(mcp_post).fallback(mcp_other_method),
-        )
+        .route("/{backend}/mcp", any(mcp))
         .with_state(edge.clone());
     let router = edge_auth::router(auth.clone())
         .merge(gateway)
@@ -403,13 +411,10 @@ fn challenge(edge: &Edge, backend: &str, error: Option<&'static str>) -> Respons
     res
 }
 
-async fn mcp_other_method(State(edge): State<Arc<Edge>>, Path(backend): Path<String>) -> Response {
-    if !edge.backends.contains_key(&backend) {
-        return json_error(StatusCode::NOT_FOUND, "not_found");
-    }
+fn method_not_allowed(allow: &'static str) -> Response {
     let mut res = json_error(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
     res.headers_mut()
-        .insert(ALLOW, HeaderValue::from_static("POST"));
+        .insert(ALLOW, HeaderValue::from_static(allow));
     res
 }
 
@@ -421,15 +426,56 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
 }
 
-async fn mcp_post(
+/// Read at most `limit` body bytes (the overall request deadline bounds time).
+async fn read_body(body: Body, limit: usize) -> Result<Bytes, Response> {
+    match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(_) => Err(json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+        )),
+    }
+}
+
+fn grant_context(backend: &Backend, grant: &AccessGrant) -> GrantContext {
+    GrantContext {
+        aud: backend.route.id.clone(),
+        sub: grant.sub.clone(),
+        client_id: grant.client_id.clone(),
+        grant_id: grant.grant_id.clone(),
+        scope: grant.scope.clone(),
+        resource_scope: grant.resource_scope.clone(),
+        gen: grant.gen,
+    }
+}
+
+/// `<prefix>/mcp` for every backend: unknown backend -> 404, a method this
+/// backend kind does not serve -> 405 (nothing is authenticated or read),
+/// then the bearer token (bound to this backend) before the body is read,
+/// the per-grant rate limit, and the backend-kind specific handling.
+async fn mcp(
     State(edge): State<Arc<Edge>>,
     Path(backend_id): Path<String>,
+    method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
     let Some(backend) = edge.backends.get(&backend_id) else {
         return json_error(StatusCode::NOT_FOUND, "not_found");
     };
+    let allowed = match &backend.handler {
+        Handler::Echo(_) => method == Method::POST,
+        Handler::Http(_) => forward::ALLOWED_METHODS.contains(&method),
+    };
+    if !allowed {
+        let mut res = method_not_allowed(match &backend.handler {
+            Handler::Echo(_) => "POST",
+            Handler::Http(_) => forward::ALLOW_HEADER,
+        });
+        res.extensions_mut()
+            .insert(LoggedBackend(backend.route.id.clone()));
+        return res;
+    }
     // Authenticate before reading the body (store lookup on the blocking pool).
     let auth = edge.auth.clone();
     let route_id = backend.route.id.clone();
@@ -445,85 +491,79 @@ async fn mcp_post(
             return challenge(&edge, &backend.route.id, Some("invalid_token"))
         }
     };
-    let tag = |mut res: Response| {
-        res.extensions_mut()
-            .insert(LoggedGrant(grant.grant_id.clone()));
-        res.extensions_mut()
-            .insert(LoggedBackend(backend.route.id.clone()));
-        res
-    };
     let now = edge.auth.now();
-    if !edge.auth.limiter().allow_id(
+    let within_rate = edge.auth.limiter().allow_id(
         "grant",
         &grant.grant_id,
         edge.limits.per_grant_per_minute,
         60,
         now,
-    ) {
-        return tag(json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
-    }
+    );
+    let result = if !within_rate {
+        Err(json_error(StatusCode::TOO_MANY_REQUESTS, "rate_limited"))
+    } else {
+        match &backend.handler {
+            Handler::Echo(echo) => {
+                echo_request(&edge, backend, echo, &grant, &headers, body, now).await
+            }
+            Handler::Http(http) => {
+                let req = HttpCall {
+                    method,
+                    headers: &headers,
+                    body,
+                    now,
+                };
+                http_request(&edge, backend, http, &grant, req).await
+            }
+        }
+    };
+    let mut res = result.unwrap_or_else(|e| e);
+    res.extensions_mut()
+        .insert(LoggedGrant(grant.grant_id.clone()));
+    res.extensions_mut()
+        .insert(LoggedBackend(backend.route.id.clone()));
+    res
+}
+
+/// The built-in echo backend: stateless JSON POST only.
+async fn echo_request(
+    edge: &Edge,
+    backend: &Backend,
+    echo: &EchoBackend,
+    grant: &AccessGrant,
+    headers: &HeaderMap,
+    body: Body,
+    now: i64,
+) -> Result<Response, Response> {
     if let Some(v) = headers.get("mcp-protocol-version") {
         let ok = v
             .to_str()
             .is_ok_and(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(&v));
         if !ok {
-            return tag(json_error(
+            return Err(json_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_protocol_version",
             ));
         }
     }
-    if !is_json(&headers) {
-        return tag(json_error(
+    if !is_json(headers) {
+        return Err(json_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_media_type",
         ));
     }
-    let limited = http_body_util::Limited::new(body, backend.route.max_request_bytes);
-    let bytes: Bytes = match limited.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return tag(json_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request_too_large",
-            ))
-        }
-    };
+    let bytes = read_body(body, backend.route.max_request_bytes).await?;
     let binding = RequestBinding {
         method: "POST",
         path: "/mcp",
         body: &bytes,
     };
-    let assertion = match edge.signer.mint(
-        &GrantContext {
-            aud: backend.route.id.clone(),
-            sub: grant.sub.clone(),
-            client_id: grant.client_id.clone(),
-            grant_id: grant.grant_id.clone(),
-            scope: grant.scope.clone(),
-            resource_scope: grant.resource_scope.clone(),
-            gen: grant.gen,
-        },
-        binding,
-        now,
-        ASSERTION_TTL,
-    ) {
-        Ok(a) => a,
-        Err(_) => {
-            return tag(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-            ))
-        }
-    };
-    // TODO(phase 3, HTTP forwarder): build the upstream request from scratch;
-    // never copy client headers through, and in particular strip any incoming
-    // `Edge-Assertion` header so only the one minted here reaches the backend.
-    // Sign the exact path and body that are forwarded (today: "/mcp").
-    let reply = match &backend.handler {
-        Handler::Echo(echo) => echo.handle(Some(&assertion), "POST", "/mcp", &bytes, now),
-    };
-    let res = match (reply.status, reply.body) {
+    let assertion = edge
+        .signer
+        .mint(&grant_context(backend, grant), binding, now, ASSERTION_TTL)
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
+    let reply = echo.handle(Some(&assertion), "POST", "/mcp", &bytes, now);
+    Ok(match (reply.status, reply.body) {
         (202, _) => StatusCode::ACCEPTED.into_response(),
         (401, _) => {
             // The backend refused the edge's own assertion: an internal fault,
@@ -543,6 +583,74 @@ async fn mcp_post(
         (status, None) => StatusCode::from_u16(status)
             .unwrap_or(StatusCode::BAD_GATEWAY)
             .into_response(),
+    })
+}
+
+/// The client request as the http forwarder needs it.
+struct HttpCall<'a> {
+    method: Method,
+    headers: &'a HeaderMap,
+    body: Body,
+    now: i64,
+}
+
+/// A `kind = "http"` backend. The upstream request is built from scratch
+/// (see `forward`): configured URL, allowlisted headers, the exact body, and
+/// an assertion over (method, upstream path, body) minted here, so a
+/// client-supplied `Edge-Assertion` can never reach the upstream.
+async fn http_request(
+    edge: &Edge,
+    backend: &Backend,
+    http: &HttpBackend,
+    grant: &AccessGrant,
+    call: HttpCall<'_>,
+) -> Result<Response, Response> {
+    let HttpCall {
+        method,
+        headers,
+        body,
+        now,
+    } = call;
+    let forwarded = forward::select_request_headers(headers)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if method == Method::POST && !is_json(headers) {
+        return Err(json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ));
+    }
+    let slot = http
+        .try_acquire(&grant.grant_id)
+        .ok_or_else(|| json_error(StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight"))?;
+    // GET (SSE stream) and DELETE (session end) carry no body upstream; a
+    // client body there is refused rather than silently dropped.
+    let bytes = if method == Method::POST {
+        read_body(body, backend.route.max_request_bytes).await?
+    } else {
+        read_body(body, 0)
+            .await
+            .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid_request"))?
     };
-    tag(res)
+    let binding = RequestBinding {
+        method: method.as_str(),
+        path: http.upstream_path(),
+        body: &bytes,
+    };
+    let assertion = edge
+        .signer
+        .mint(&grant_context(backend, grant), binding, now, ASSERTION_TTL)
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
+    Ok(http
+        .forward(
+            Outgoing {
+                method,
+                headers: forwarded,
+                body: bytes,
+                assertion,
+                grant_id: grant.grant_id.clone(),
+            },
+            slot,
+            edge.auth.clone(),
+        )
+        .await)
 }
