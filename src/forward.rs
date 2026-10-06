@@ -188,9 +188,11 @@ impl HttpBackend {
             req = req.body(out.body);
         }
         let sent = tokio::time::timeout(self.cfg.response_timeout, req.send()).await;
+        // Connection failures (refused, DNS, TLS, connect timeout) are 502;
+        // an upstream that accepted the request but is slow to answer is 504.
         let resp = match sent {
             Ok(Ok(resp)) => resp,
-            Ok(Err(e)) if e.is_timeout() => {
+            Ok(Err(e)) if e.is_timeout() && !e.is_connect() => {
                 self.event(&log, "upstream_timeout", &out.grant_id);
                 return json_error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout");
             }
