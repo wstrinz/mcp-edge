@@ -35,6 +35,7 @@ const MARKER: &str = "SYNTHETIC_BODY_MARKER";
 struct Seen {
     method: String,
     path: String,
+    query: Option<String>,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     verified: Result<(), String>,
@@ -156,6 +157,7 @@ async fn upstream(State(st): State<Arc<UpState>>, req: Request) -> Response {
     st.seen.lock().unwrap().push(Seen {
         method: method.clone(),
         path: path.clone(),
+        query: parts.uri.query().map(str::to_string),
         headers: headers.clone(),
         body: body.to_vec(),
         verified: verified.clone(),
@@ -955,5 +957,76 @@ async fn hevy_compatibility_exact_bytes_path_accept_and_session() {
             ),
         ]
     );
+    h.finish().await;
+}
+
+/// Send one raw HTTP/1.1 request (paths reqwest would normalise) and return
+/// the status code.
+async fn raw_status(h: &Harness, request: String) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(h.addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let mut n = 0;
+    while n < 12 {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf[n..]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read > 0, "connection closed early");
+        n += read;
+    }
+    let line = String::from_utf8_lossy(&buf[..n]).to_string();
+    line[9..12].parse().unwrap()
+}
+
+/// DESIGN.md checklist item 7: nothing in a request chooses the upstream.
+#[tokio::test]
+async fn crafted_paths_queries_and_host_headers_cannot_redirect_the_forwarder() {
+    let (mut h, up) = setup().await;
+    let token = access_token(&mut h, "up").await;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    let req = |target: &str, host: &str, extra: &str| {
+        format!(
+            "POST {target} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let elsewhere = format!("127.0.0.1:{}", up.addr.port());
+    // Odd paths never match a backend route.
+    for target in [
+        "/up%2Fmcp",
+        "/up/mcp/",
+        "/up/mcp/../../v1/mcp",
+        "/up/MCP",
+        "/up/mcp/extra",
+        "//up/mcp",
+        &format!("http://{elsewhere}/v1/mcp"),
+    ] {
+        let status = raw_status(&h, req(target, "edge.test", "")).await;
+        assert!(matches!(status, 400 | 404), "{target}: {status}");
+    }
+    assert!(up.seen().is_empty());
+    // Query strings, Host, X-Forwarded-Host and Forwarded change nothing:
+    // the configured URL is the only destination, without the query.
+    let status = raw_status(
+        &h,
+        req(
+            "/up/mcp?url=http://evil.example/&target=/v2/mcp",
+            &elsewhere,
+            "X-Forwarded-Host: evil.example\r\nForwarded: host=evil.example\r\n",
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let seen = up.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        (seen[0].path.as_str(), seen[0].query.as_deref()),
+        ("/v1/mcp", None)
+    );
+    assert_eq!(seen[0].verified, Ok(()));
+    assert_eq!(header(&seen[0], "host").unwrap(), up.addr.to_string());
     h.finish().await;
 }
