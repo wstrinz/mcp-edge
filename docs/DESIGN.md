@@ -228,18 +228,21 @@ below was taken.
   (WebAuthn), per-backend MCP cap (default 1 MiB, echo 64 KiB). Per client IP per
   minute: 600 requests, 30 authorize, 60 token/revoke, 20 owner ceremonies; 10
   registrations per hour per IP and 60 globally; 300 MCP requests per grant per minute.
-  Anonymous state never refuses the owner: WebAuthn ceremonies are capped at 4 per
-  client network and 64 overall, and pending authorization requests at 4 per network
-  and 64 overall, evicting the network's own oldest entry and then the oldest
-  unverified one instead of answering 429 (found in review: a refusing cap let one
-  anonymous IP lock the owner out of login and consent). A response cap is not needed for the in-binary echo and
+  Anonymous state never refuses the owner (found in review: a refusing cap let one
+  anonymous IP lock the owner out of login and consent). WebAuthn ceremonies (~1 KiB)
+  are capped at 4 per client network and 4096 overall; when full, anonymous logins are
+  evicted before ceremonies bound to a pending request or a registration, oldest
+  first. Pending authorization requests are capped at 4 unverified per network and
+  4096 overall; only unverified ones are ever evicted (oldest first), never one with a
+  passkey proof. Displacing the owner's in-progress state needs thousands of networks. A response cap is not needed for the in-binary echo and
   belongs to the HTTP forwarder in phase 3.
 - Client IP is the TCP peer. Only when the peer is inside `EDGE_TRUSTED_PROXIES`
   (default RFC 1918, loopback and `fc00::/7`, since only Coolify's Traefik can reach
   the container) is `X-Forwarded-For` read, taking the right-most hop that is not a
   trusted proxy; an unparsable hop ends the walk. IPv6 is limited per /64. The
-  limiter holds at most 10 000 keys; when all are live, new keys are refused for the
-  rest of the window (fail closed, a bounded DoS trade-off).
+  limiter holds at most 10 000 keys; when all are live it evicts the window closest
+  to expiry rather than refusing the new client (a flood can reset someone's budget
+  early, never lock out a newcomer).
 - Logs: one line per request (method, route template, status, ms, backend, grant id)
   plus named events (`consent_approved`, `refresh_reuse`, `grant_revoked`, ...). A test
   greps captured logs for every secret the flow produced.

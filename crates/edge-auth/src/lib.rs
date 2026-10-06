@@ -59,7 +59,6 @@ use url::Url;
 const TX_COOKIE: &str = "__Host-edge_tx";
 const CEREMONY_COOKIE: &str = "__Host-edge_cer";
 const SESSION_COOKIE: &str = "__Host-edge_sid";
-const MAX_CEREMONIES: usize = 64;
 const MAX_CEREMONIES_PER_NET: usize = 4;
 /// Live pending authorization requests one client network may hold.
 const MAX_PENDING_PER_NET: i64 = 4;
@@ -120,6 +119,13 @@ struct Ceremony {
     expires: i64,
     net: Option<std::net::IpAddr>,
     seq: u64,
+}
+
+impl Ceremony {
+    /// A login not tied to any pending authorization request.
+    fn is_anonymous(&self) -> bool {
+        matches!(self.kind, CeremonyKind::Login { tx: None })
+    }
 }
 
 struct Inner {
@@ -465,9 +471,11 @@ impl AuthState {
     }
 
     /// Store a ceremony. Never refuses: a client network keeps at most
-    /// `MAX_CEREMONIES_PER_NET` (its oldest is evicted), and when the table is
-    /// full the oldest overall is evicted, so anonymous callers cannot lock the
-    /// owner out by filling it.
+    /// `MAX_CEREMONIES_PER_NET`, and the table (`max_ceremonies`, thousands)
+    /// evicts instead of refusing. Eviction takes anonymous login ceremonies
+    /// (no pending request, no enrollment/session) before ones bound to an
+    /// authorization request or a registration, oldest first, so displacing
+    /// the owner's in-progress ceremony needs thousands of client networks.
     fn put_ceremony(
         &self,
         kind: CeremonyKind,
@@ -478,21 +486,21 @@ impl AuthState {
         let net = ip.map(support::network_key);
         let mut map = self.0.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, c| c.expires > now);
-        let oldest = |map: &HashMap<String, Ceremony>, same_net: bool| {
-            map.iter()
+        let evict = |map: &mut HashMap<String, Ceremony>, same_net: bool| {
+            let victim = map
+                .iter()
                 .filter(|(_, c)| !same_net || c.net == net)
-                .min_by_key(|(_, c)| c.seq)
-                .map(|(k, _)| k.clone())
+                .min_by_key(|(_, c)| (!c.is_anonymous(), c.seq))
+                .map(|(k, _)| k.clone());
+            if let Some(k) = victim {
+                map.remove(&k);
+            }
         };
         if map.values().filter(|c| c.net == net).count() >= MAX_CEREMONIES_PER_NET {
-            if let Some(k) = oldest(&map, true) {
-                map.remove(&k);
-            }
+            evict(&mut map, true);
         }
-        if map.len() >= MAX_CEREMONIES {
-            if let Some(k) = oldest(&map, false) {
-                map.remove(&k);
-            }
+        if map.len() >= self.config().limits.max_ceremonies.max(1) {
+            evict(&mut map, false);
         }
         let secret = random_secret("");
         map.insert(

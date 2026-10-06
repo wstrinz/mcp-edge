@@ -51,6 +51,8 @@ pub struct Limits {
     pub owner_per_ip_per_minute: u32,
     /// Live pending authorization requests across all clients.
     pub max_pending: usize,
+    /// Live WebAuthn ceremonies across all clients (about 1 KiB each).
+    pub max_ceremonies: usize,
     /// Registered clients; unused old registrations are pruned first.
     pub max_clients: usize,
     /// Failed enrollment-code attempts before enrollment locks until restart.
@@ -65,7 +67,8 @@ impl Default for Limits {
             authorize_per_ip_per_minute: 30,
             token_per_ip_per_minute: 60,
             owner_per_ip_per_minute: 20,
-            max_pending: 64,
+            max_pending: 4096,
+            max_ceremonies: 4096,
             max_clients: 100,
             max_enroll_failures: 10,
         }

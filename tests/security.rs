@@ -314,6 +314,82 @@ async fn anonymous_floods_cannot_fill_ceremony_or_pending_tables() {
     h.finish().await;
 }
 
+#[tokio::test]
+async fn floods_from_many_networks_never_evict_owner_progress() {
+    // Tiny global caps so a 40-network flood overflows both tables.
+    let mut h = Harness::start_with(Options {
+        auth_limits: Limits {
+            max_pending: 8,
+            max_ceremonies: 8,
+            authorize_per_ip_per_minute: 1000,
+            owner_per_ip_per_minute: 1000,
+            token_per_ip_per_minute: 1000,
+            ..Limits::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    h.enroll().await;
+    let client = h.register_client(CALLBACK).await;
+    let (_, challenge) = pkce();
+    let owner_ip = "203.0.113.10";
+
+    // Request 1: passkey-verified, waiting for the consent click.
+    let mut o1 = Browser::from_ip(owner_ip);
+    let tx1 = h
+        .begin(&mut o1, &client, CALLBACK, "echo", &challenge, "o1")
+        .await;
+    assert_eq!(h.owner_login(&mut o1, Some(&tx1)).await, 200);
+    let csrf1 = h.consent_csrf(&mut o1, &tx1).await.unwrap();
+
+    // Request 2: passkey ceremony in progress.
+    let mut o2 = Browser::from_ip(owner_ip);
+    let tx2 = h
+        .begin(&mut o2, &client, CALLBACK, "echo", &challenge, "o2")
+        .await;
+    let res = h
+        .post_json(&mut o2, "/owner/login/start", &json!({ "tx": tx2 }))
+        .await;
+    let options: RequestChallengeResponse = res.json().await.unwrap();
+
+    // Flood A: anonymous ceremonies from 40 networks.
+    for i in 0..40 {
+        let mut anon = Browser::from_ip(&format!("198.51.{i}.1"));
+        let res = h
+            .post_json(&mut anon, "/owner/login/start", &json!({}))
+            .await;
+        assert_eq!(res.status(), 200);
+    }
+    // The owner's bound ceremony survived and completes.
+    let answer = h
+        .passkey
+        .do_authentication(h.origin.clone(), options)
+        .unwrap();
+    let res = h
+        .post_json(
+            &mut o2,
+            "/owner/login/finish",
+            &serde_json::to_value(&answer).unwrap(),
+        )
+        .await;
+    assert_eq!(res.status(), 200, "owner ceremony was evicted");
+    let csrf2 = h.consent_csrf(&mut o2, &tx2).await.unwrap();
+
+    // Flood B: authorization requests from 40 networks.
+    for i in 0..40 {
+        let mut anon = Browser::from_ip(&format!("192.0.{i}.1"));
+        let q = Harness::authorize_query(&client, CALLBACK, "echo", &challenge, &format!("f{i}"));
+        assert_eq!(h.get(&mut anon, &q).await.status(), 303);
+    }
+    // Both verified requests survived and yield codes.
+    for (b, tx, csrf) in [(&mut o1, &tx1, &csrf1), (&mut o2, &tx2, &csrf2)] {
+        let res = approve(&h, b, tx, csrf).await;
+        assert_eq!(res.status(), 303);
+        assert!(location(&res).unwrap().contains("code="));
+    }
+    h.finish().await;
+}
+
 // ---------------------------------------------------------------- item 2
 
 #[tokio::test]

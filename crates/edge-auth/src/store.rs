@@ -327,10 +327,14 @@ impl Store {
 
     // ---- pending authorization requests ----
 
-    /// Make room for one more live pending request from client network `net`:
-    /// drop that network's oldest live requests beyond `per_net - 1`, then, if
-    /// the table holds `max` live requests, the oldest one not yet backed by a
-    /// passkey proof. Returns false only if every live request is verified.
+    /// Make room for one more live pending request from client network `net`.
+    /// Verified requests (passkey proof done) are never evicted:
+    /// 1. the network keeps at most `per_net - 1` others, dropping its oldest
+    ///    unverified ones;
+    /// 2. if the table holds `max` live requests, the oldest unverified one
+    ///    anywhere is dropped.
+    ///
+    /// Returns false only when nothing evictable is left.
     pub fn make_room_for_pending(
         &self,
         net: &str,
@@ -341,7 +345,8 @@ impl Store {
         let conn = self.conn();
         conn.execute(
             "DELETE FROM pending WHERE id IN (
-                SELECT id FROM pending WHERE net = ?1 AND expires > ?2 AND used = 0
+                SELECT id FROM pending
+                WHERE net = ?1 AND expires > ?2 AND used = 0 AND verified_at IS NULL
                 ORDER BY created DESC, rowid DESC LIMIT -1 OFFSET ?3)",
             params![net, now, (per_net - 1).max(0)],
         )?;

@@ -90,8 +90,9 @@ impl LogSink for MemoryLog {
 pub struct ClientIp(pub IpAddr);
 
 /// Fixed-window counters keyed by (bucket, client network). IPv6 clients are
-/// grouped by /64. The table is bounded; when it is full of live windows new
-/// keys are refused (fail closed).
+/// grouped by /64. The table is bounded; when it is full of live windows the
+/// window closest to expiry is evicted, so a flood of new addresses can reset
+/// someone's budget early but never locks out a new client.
 pub struct RateLimiter {
     windows: Mutex<HashMap<BucketKey, (i64, u32)>>,
     max_keys: usize,
@@ -151,7 +152,16 @@ impl RateLimiter {
         if !windows.contains_key(&key) && windows.len() >= self.max_keys {
             windows.retain(|_, (end, _)| *end > now);
             if windows.len() >= self.max_keys {
-                return false;
+                // Never refuse a new client because the table is full: drop
+                // the window closest to expiry (its owner merely gets a fresh
+                // window early).
+                let victim = windows
+                    .iter()
+                    .min_by_key(|(_, (end, _))| *end)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = victim {
+                    windows.remove(&k);
+                }
             }
         }
         let entry = windows.entry(key).or_insert((now + window_secs, 0));
@@ -279,6 +289,23 @@ mod tests {
         let b = Some("2001:db8::2".parse().unwrap());
         assert!(l.allow("v6", a, 1, 60, 100));
         assert!(!l.allow("v6", b, 1, 60, 100));
+    }
+
+    #[test]
+    fn full_limiter_evicts_soonest_expiring_instead_of_refusing() {
+        let l = RateLimiter::new(16);
+        // Fill the table with live windows; the first one expires soonest.
+        for i in 0..16u8 {
+            let ip = Some(std::net::IpAddr::from([10, 0, 0, i]));
+            assert!(l.allow("b", ip, 1, 60 + i64::from(i), 100));
+        }
+        // A brand-new client is still admitted.
+        let newcomer = Some("192.0.2.1".parse().unwrap());
+        assert!(l.allow("b", newcomer, 1, 60, 100));
+        // The evicted key was the one closest to expiry (10.0.0.0), which now
+        // simply gets a fresh window; the others keep theirs.
+        assert!(l.allow("b", Some("10.0.0.0".parse().unwrap()), 1, 60, 100));
+        assert!(!l.allow("b", Some("10.0.0.15".parse().unwrap()), 1, 60, 100));
     }
 
     #[test]
