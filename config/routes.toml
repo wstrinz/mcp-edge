@@ -14,18 +14,17 @@ scopes = ["mcp"]
 grant_lifetime_secs = 86400  # absolute grant lifetime; refresh never extends it
 max_request_bytes = 65536
 
-# Example HTTP backend (not enabled). The upstream must verify Edge-Assertion
-# (aud = "hevy", req over method + "/mcp" + body) before this goes live.
-#
-# [[backend]]
-# id = "hevy"                               # public URL: https://<edge>/hevy/mcp
-# kind = "http"
-# consent = "edge"
-# display_name = "Hevy"
-# url = "https://hevy-mcp.app.stri.nz/mcp"  # exact upstream; signed path is /mcp
-# max_request_bytes = 1048576
-# max_response_bytes = 4194304
-# connect_timeout_secs = 5
-# response_timeout_secs = 20                # time to response headers (<= 25)
-# idle_timeout_secs = 60                    # longest gap between body chunks
-# max_concurrent_per_grant = 4              # in-flight requests + open streams
+# Hevy (wstrinz/hevy-mcp, edge mode): the upstream verifies Edge-Assertion
+# (aud = "hevy", req over method + "/mcp" + body) and refuses anything else.
+[[backend]]
+id = "hevy"                               # public URL: https://<edge>/hevy/mcp
+kind = "http"
+consent = "edge"
+display_name = "Hevy"
+url = "https://hevy-mcp.app.stri.nz/mcp"  # exact upstream; signed path is /mcp
+max_request_bytes = 1048576
+max_response_bytes = 4194304
+connect_timeout_secs = 5
+response_timeout_secs = 20                # time to response headers (<= 25)
+idle_timeout_secs = 60                    # longest gap between body chunks
+max_concurrent_per_grant = 4              # in-flight requests + open streams
