@@ -169,6 +169,17 @@ fn flat(r: HandlerResult) -> Response {
     r.unwrap_or_else(|e| e)
 }
 
+/// Run a handler body (SQLite, WebAuthn verification) on the blocking pool so
+/// async workers, and thus `/healthz`, never wait on the database.
+async fn blocking<F>(f: F) -> Response
+where
+    F: FnOnce() -> HandlerResult + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || flat(f()))
+        .await
+        .unwrap_or_else(|_| oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))
+}
+
 fn no_store(mut res: Response) -> Response {
     let h = res.headers_mut();
     h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -728,7 +739,7 @@ async fn register(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat(register_inner(&s, ip_of(&ip), &headers, &body))
+    blocking(move || register_inner(&s, ip_of(&ip), &headers, &body)).await
 }
 
 fn register_inner(
@@ -818,11 +829,7 @@ async fn authorize(
     ip: Option<Extension<ClientIp>>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    flat(authorize_inner(
-        &s,
-        ip_of(&ip),
-        query.as_deref().unwrap_or(""),
-    ))
+    blocking(move || authorize_inner(&s, ip_of(&ip), query.as_deref().unwrap_or(""))).await
 }
 
 fn authorize_inner(s: &AuthState, ip: Option<std::net::IpAddr>, query: &str) -> HandlerResult {
@@ -932,11 +939,7 @@ async fn consent_page(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    flat(consent_page_inner(
-        &s,
-        &headers,
-        query.as_deref().unwrap_or(""),
-    ))
+    blocking(move || consent_page_inner(&s, &headers, query.as_deref().unwrap_or(""))).await
 }
 
 fn consent_page_inner(s: &AuthState, headers: &HeaderMap, query: &str) -> HandlerResult {
@@ -977,7 +980,7 @@ fn consent_page_inner(s: &AuthState, headers: &HeaderMap, query: &str) -> Handle
 }
 
 async fn consent_submit(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
-    flat(consent_submit_inner(&s, &headers, &body))
+    blocking(move || consent_submit_inner(&s, &headers, &body)).await
 }
 
 fn consent_submit_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> HandlerResult {
@@ -1102,7 +1105,7 @@ async fn login_start(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat(login_start_inner(&s, ip_of(&ip), &headers, &body))
+    blocking(move || login_start_inner(&s, ip_of(&ip), &headers, &body)).await
 }
 
 fn login_start_inner(
@@ -1137,7 +1140,7 @@ async fn login_finish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat(login_finish_inner(&s, ip_of(&ip), &headers, &body))
+    blocking(move || login_finish_inner(&s, ip_of(&ip), &headers, &body)).await
 }
 
 fn login_finish_inner(
@@ -1204,7 +1207,7 @@ async fn register_start(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat(register_start_inner(&s, ip_of(&ip), &headers, &body))
+    blocking(move || register_start_inner(&s, ip_of(&ip), &headers, &body)).await
 }
 
 fn register_start_inner(
@@ -1294,7 +1297,7 @@ async fn register_finish(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat(register_finish_inner(&s, ip_of(&ip), &headers, &body))
+    blocking(move || register_finish_inner(&s, ip_of(&ip), &headers, &body)).await
 }
 
 fn register_finish_inner(
@@ -1347,7 +1350,7 @@ fn register_finish_inner(
 // ------------------------------------------------------------- owner pages
 
 async fn owner_home(State(s): State<AuthState>, headers: HeaderMap) -> Response {
-    flat(owner_home_inner(&s, &headers))
+    blocking(move || owner_home_inner(&s, &headers)).await
 }
 
 fn owner_home_inner(s: &AuthState, headers: &HeaderMap) -> HandlerResult {
@@ -1381,10 +1384,11 @@ fn owner_home_inner(s: &AuthState, headers: &HeaderMap) -> HandlerResult {
 }
 
 async fn enroll_page(State(s): State<AuthState>) -> Response {
-    match s.0.store.passkey_count() {
-        Ok(n) => s.html(StatusCode::OK, pages::enroll(n > 0)),
-        Err(_) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
-    }
+    blocking(move || {
+        let enrolled = s.db("passkeys", s.0.store.passkey_count())? > 0;
+        Ok(s.html(StatusCode::OK, pages::enroll(enrolled)))
+    })
+    .await
 }
 
 fn owner_form(
@@ -1410,40 +1414,49 @@ fn owner_form(
 }
 
 async fn owner_revoke(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
-    flat((|| {
-        let (form, _) = owner_form(&s, &headers, &body)?;
-        let grant_id = form.get("grant_id").map(String::as_str).unwrap_or("");
-        if s.db("grants", s.0.store.revoke_grant(grant_id))? {
-            s.log(&format!("event=grant_revoked by=owner grant={grant_id}"));
-        }
-        let mut res = redirect_303("/owner");
-        res.extensions_mut()
-            .insert(LoggedGrant(grant_id.to_owned()));
-        Ok(res)
-    })())
+    blocking(move || {
+        (|| {
+            let (form, _) = owner_form(&s, &headers, &body)?;
+            let grant_id = form.get("grant_id").map(String::as_str).unwrap_or("");
+            if s.db("grants", s.0.store.revoke_grant(grant_id))? {
+                s.log(&format!("event=grant_revoked by=owner grant={grant_id}"));
+            }
+            let mut res = redirect_303("/owner");
+            res.extensions_mut()
+                .insert(LoggedGrant(grant_id.to_owned()));
+            Ok(res)
+        })()
+    })
+    .await
 }
 
 async fn owner_revoke_all(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
-    flat((|| {
-        owner_form(&s, &headers, &body)?;
-        let ids = s.db("grants", s.0.store.revoke_all_grants())?;
-        s.log(&format!(
-            "event=grants_revoked by=owner count={}",
-            ids.len()
-        ));
-        Ok(redirect_303("/owner"))
-    })())
+    blocking(move || {
+        (|| {
+            owner_form(&s, &headers, &body)?;
+            let ids = s.db("grants", s.0.store.revoke_all_grants())?;
+            s.log(&format!(
+                "event=grants_revoked by=owner count={}",
+                ids.len()
+            ));
+            Ok(redirect_303("/owner"))
+        })()
+    })
+    .await
 }
 
 async fn owner_logout(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
-    flat((|| {
-        let (_, session) = owner_form(&s, &headers, &body)?;
-        s.db("session", s.0.store.delete_session(&hash_secret(&session)))?;
-        let mut res = redirect_303("/owner");
-        res.headers_mut()
-            .append(SET_COOKIE, cookie_header(SESSION_COOKIE, "", 0));
-        Ok(res)
-    })())
+    blocking(move || {
+        (|| {
+            let (_, session) = owner_form(&s, &headers, &body)?;
+            s.db("session", s.0.store.delete_session(&hash_secret(&session)))?;
+            let mut res = redirect_303("/owner");
+            res.headers_mut()
+                .append(SET_COOKIE, cookie_header(SESSION_COOKIE, "", 0));
+            Ok(res)
+        })()
+    })
+    .await
 }
 
 // ------------------------------------------------------------------ tokens
@@ -1454,7 +1467,7 @@ async fn token(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat(token_inner(&s, ip_of(&ip), &headers, &body))
+    blocking(move || token_inner(&s, ip_of(&ip), &headers, &body)).await
 }
 
 fn token_form(
@@ -1613,29 +1626,32 @@ async fn revoke(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    flat((|| {
-        s.limit(
-            "token",
-            ip_of(&ip),
-            s.config().limits.token_per_ip_per_minute,
-            60,
-        )?;
-        let form = token_form(&s, &headers, &body)?;
-        let token = form
-            .get("token")
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-        let client_id = form.get("client_id").map(String::as_str).unwrap_or("");
-        let mut res = no_store(StatusCode::OK.into_response());
-        if let Some((grant_id, owner)) =
-            s.db("revoke", s.0.store.grant_for_any_token(&hash_secret(token)))?
-        {
-            // RFC 7009: a token of another client is silently ignored.
-            if owner == client_id && s.db("revoke", s.0.store.revoke_grant(&grant_id))? {
-                s.log(&format!("event=grant_revoked by=client grant={grant_id}"));
-                res.extensions_mut().insert(LoggedGrant(grant_id));
+    blocking(move || {
+        (|| {
+            s.limit(
+                "token",
+                ip_of(&ip),
+                s.config().limits.token_per_ip_per_minute,
+                60,
+            )?;
+            let form = token_form(&s, &headers, &body)?;
+            let token = form
+                .get("token")
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| oauth_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+            let client_id = form.get("client_id").map(String::as_str).unwrap_or("");
+            let mut res = no_store(StatusCode::OK.into_response());
+            if let Some((grant_id, owner)) =
+                s.db("revoke", s.0.store.grant_for_any_token(&hash_secret(token)))?
+            {
+                // RFC 7009: a token of another client is silently ignored.
+                if owner == client_id && s.db("revoke", s.0.store.revoke_grant(&grant_id))? {
+                    s.log(&format!("event=grant_revoked by=client grant={grant_id}"));
+                    res.extensions_mut().insert(LoggedGrant(grant_id));
+                }
             }
-        }
-        Ok(res)
-    })())
+            Ok(res)
+        })()
+    })
+    .await
 }

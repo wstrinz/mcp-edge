@@ -10,6 +10,9 @@ use std::{
 
 pub type StoreResult<T> = Result<T, rusqlite::Error>;
 
+/// Seconds between `last_used` writes for one grant.
+const LAST_USED_RESOLUTION: i64 = 60;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS consumed_enroll_codes (hash TEXT PRIMARY KEY, at INTEGER NOT NULL);
@@ -663,11 +666,16 @@ impl Store {
                 grant_from_row,
             )
             .optional()?;
+        // `last_used` is informational (owner page): write it at most once a
+        // minute per grant instead of on every MCP request.
         if let Some(g) = &grant {
-            conn.execute(
-                "UPDATE grants SET last_used = ?2 WHERE id = ?1",
-                params![g.id, now],
-            )?;
+            if g.last_used.is_none_or(|t| now - t >= LAST_USED_RESOLUTION) {
+                conn.execute(
+                    "UPDATE grants SET last_used = ?2 WHERE id = ?1
+                        AND (last_used IS NULL OR last_used <= ?2 - ?3)",
+                    params![g.id, now, LAST_USED_RESOLUTION],
+                )?;
+            }
         }
         Ok(grant)
     }
@@ -771,4 +779,42 @@ fn revoke_grant_tx(tx: &rusqlite::Transaction<'_>, grant_id: &str) -> StoreResul
     )?;
     tx.execute("UPDATE codes SET used = 1 WHERE grant_id = ?1", [grant_id])?;
     Ok(n == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_used_is_written_at_most_once_a_minute() {
+        let store = Store::open(None).unwrap();
+        let t0 = 1_800_000_000;
+        store
+            .insert_client("c", None, &["https://cb.test/".to_string()], t0)
+            .unwrap();
+        store
+            .create_grant_with_code(
+                "g",
+                "c",
+                "echo",
+                "mcp",
+                t0 + 86_400,
+                "code",
+                "https://cb.test/",
+                "ch",
+                t0 + 60,
+                t0,
+            )
+            .unwrap();
+        store
+            .activate_grant("g", "acc", t0 + 900, "ref", t0)
+            .unwrap();
+        let last_used = |s: &Store, now| s.active_grants(now).unwrap()[0].0.last_used;
+        store.grant_for_access("acc", t0 + 1).unwrap().unwrap();
+        assert_eq!(last_used(&store, t0 + 1), Some(t0 + 1));
+        store.grant_for_access("acc", t0 + 30).unwrap().unwrap();
+        assert_eq!(last_used(&store, t0 + 30), Some(t0 + 1), "throttled");
+        store.grant_for_access("acc", t0 + 61).unwrap().unwrap();
+        assert_eq!(last_used(&store, t0 + 61), Some(t0 + 61));
+    }
 }

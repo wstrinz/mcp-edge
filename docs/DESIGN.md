@@ -213,6 +213,9 @@ below was taken.
   ceremony state is memory-only (5 minutes). Revoked/expired grants are deleted 7 days
   after creation; never-used client registrations are pruned after 1 hour when the
   100-client cap is reached.
+- All SQLite work (and WebAuthn verification) runs on tokio's blocking pool, never on
+  the async workers; `/healthz` touches no store and `/readyz` checks it with a 2 s
+  deadline. A grant's `last_used` is written at most once a minute.
 - DCR accepts at most 4 redirect URIs, all exact allowlist members; unknown metadata
   is ignored; any requested `token_endpoint_auth_method` is substituted with `none`
   (RFC 7591 §3.2.1) and returned as such; `client_name` is stripped of control

@@ -234,7 +234,14 @@ async fn healthz() -> Response {
 }
 
 async fn readyz(State(edge): State<Arc<Edge>>) -> Response {
-    if edge.auth.ready() {
+    // The store check runs on the blocking pool with its own deadline.
+    let auth = edge.auth.clone();
+    let ready = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || auth.ready()),
+    )
+    .await;
+    if matches!(ready, Ok(Ok(true))) {
         axum::Json(json!({ "status": "ready" })).into_response()
     } else {
         json_error(StatusCode::SERVICE_UNAVAILABLE, "not_ready")
@@ -422,8 +429,15 @@ async fn mcp_post(
     let Some(backend) = edge.backends.get(&backend_id) else {
         return json_error(StatusCode::NOT_FOUND, "not_found");
     };
-    // Authenticate before reading the body.
-    let grant: AccessGrant = match edge.auth.authenticate_bearer(&headers, &backend.route.id) {
+    // Authenticate before reading the body (store lookup on the blocking pool).
+    let auth = edge.auth.clone();
+    let route_id = backend.route.id.clone();
+    let bearer_headers = headers.clone();
+    let authenticated =
+        tokio::task::spawn_blocking(move || auth.authenticate_bearer(&bearer_headers, &route_id))
+            .await
+            .unwrap_or(Err(BearerError::Invalid));
+    let grant: AccessGrant = match authenticated {
         Ok(g) => g,
         Err(BearerError::Missing) => return challenge(&edge, &backend.route.id, None),
         Err(BearerError::Invalid) => {
