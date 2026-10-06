@@ -649,6 +649,8 @@ pub fn parse_response<T: ResponseMeta>(bytes: &[u8]) -> Result<T, MetaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type Mutation<T> = (&'static str, Box<dyn Fn(&mut T)>);
     use serde_json::json;
 
     pub(crate) fn mcp_meta() -> McpPostMeta {
@@ -740,7 +742,7 @@ mod tests {
 
     #[test]
     fn mcp_post_field_rules() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut McpPostMeta)>)> = vec![
+        let cases: Vec<Mutation<McpPostMeta>> = vec![
             ("path", Box::new(|m| m.path = "/mcp/x".into())),
             ("path", Box::new(|m| m.path = "/MCP".into())),
             (
@@ -784,7 +786,7 @@ mod tests {
     #[test]
     fn consent_request_rules() {
         consent_meta().validate().unwrap();
-        let cases: Vec<(&str, Box<dyn Fn(&mut ConsentRequestMeta)>)> = vec![
+        let cases: Vec<Mutation<ConsentRequestMeta>> = vec![
             ("tx", Box::new(|m| m.tx = "x".repeat(33))),
             ("grant_id", Box::new(|m| m.grant_id = "abc".into())),
             (

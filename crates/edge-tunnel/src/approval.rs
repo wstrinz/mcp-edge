@@ -343,6 +343,8 @@ pub fn verify(
 mod tests {
     use super::*;
 
+    type Mutation<T> = (&'static str, Box<dyn Fn(&mut T)>);
+
     const NOW: i64 = 1_800_000_000;
 
     fn origin_key() -> SecretKey {
@@ -484,7 +486,7 @@ mod tests {
     #[test]
     fn each_bound_claim_must_match() {
         let a = approve(NOW);
-        let cases: Vec<(&str, Box<dyn Fn(&mut ApprovalBinding)>)> = vec![
+        let cases: Vec<Mutation<ApprovalBinding>> = vec![
             (
                 "edge_id",
                 Box::new(|b| b.edge_id = SecretKey::from_bytes(&[6u8; 32]).public()),

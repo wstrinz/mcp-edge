@@ -213,6 +213,8 @@ pub fn is_fingerprint(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    type Mutation<T> = (&'static str, Box<dyn Fn(&mut T)>);
+
     fn sample() -> Enrollment {
         let edge = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
         let assert_key = edge_assert::Signer::from_seed(&[1u8; 32], "https://edge.example")
@@ -284,7 +286,7 @@ mod tests {
         let s = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(extra));
         assert_eq!(Enrollment::parse(&s), Err(EnrollmentError::Malformed));
 
-        let cases: Vec<(&str, Box<dyn Fn(&mut Enrollment)>)> = vec![
+        let cases: Vec<Mutation<Enrollment>> = vec![
             ("iss", Box::new(|e| e.iss = "http://edge.example".into())),
             (
                 "iss",
