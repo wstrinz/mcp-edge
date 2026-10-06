@@ -787,6 +787,10 @@ async fn stream_response(
     let Some(meta_bytes) = encode(&meta, Op::McpPost) else {
         return abort(send);
     };
+    // A full body over the cap is refused before anything is written.
+    if matches!(&response.body, Body::Full(b) if b.len() > limits::MCP_RESPONSE) {
+        return abort(send);
+    }
     let write_deadline = |now: Instant| (now + stall).min(deadline);
     macro_rules! write_or_abort {
         ($bytes:expr, $cap:expr) => {{

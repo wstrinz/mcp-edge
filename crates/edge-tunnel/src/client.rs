@@ -279,13 +279,8 @@ fn frame_err(conn: &Connection, e: FrameError, before_meta: bool) -> TunnelError
         FrameError::TooLarge if before_meta => TunnelError::Protocol("response metadata too large"),
         FrameError::TooLarge => TunnelError::Protocol("response chunk too large"),
         FrameError::TrailingBytes => TunnelError::Protocol("bytes after terminator"),
-        FrameError::Truncated | FrameError::Io => {
-            if before_meta {
-                TunnelError::Protocol("stream ended before response metadata")
-            } else {
-                TunnelError::Truncated
-            }
-        }
+        // Missing or reset before the terminator, at any point: truncated.
+        FrameError::Truncated | FrameError::Io => TunnelError::Truncated,
     }
 }
 
