@@ -51,8 +51,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 
 /// Load `dir/name`, creating it atomically with a fresh random seed if absent.
 pub fn load_or_create_seed(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
-    // A concurrent starter's leftover-cleanup can remove our temporary before
-    // it is linked; that surfaces as NotFound and is simply retried.
+    // Defensive: if our temporary vanishes before it is linked (NotFound),
+    // start over; an existing final file is then simply read.
     let mut attempt = 0;
     loop {
         match try_load_or_create(dir, name) {
@@ -69,11 +69,18 @@ fn try_load_or_create(dir: &Path, name: &str) -> io::Result<[u8; 32]> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    // Remove temporaries left behind by an earlier crash (best effort).
+    // Remove temporaries left behind by an earlier crash (best effort). Only
+    // ones older than a minute, so a concurrent starter's file is left alone.
     if let Ok(entries) = fs::read_dir(dir) {
         let prefix = format!("{name}.tmp-");
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= std::time::Duration::from_secs(60));
+            if stale && entry.file_name().to_string_lossy().starts_with(&prefix) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -154,8 +161,19 @@ mod tests {
     #[test]
     fn crash_leftovers_do_not_brick_startup() {
         let d = TempDir::new();
-        fs::write(d.0.join("k.bin.tmp-deadbeef"), []).unwrap();
-        fs::write(d.0.join("k.bin.tmp-0123"), [7u8; 5]).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        for (name, data) in [
+            ("k.bin.tmp-deadbeef", &[][..]),
+            ("k.bin.tmp-0123", &[7u8; 5][..]),
+        ] {
+            fs::write(d.0.join(name), data).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(d.0.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
         let seed = load_or_create_seed(&d.0, "k.bin").unwrap();
         assert_eq!(fs::read(d.0.join("k.bin")).unwrap(), seed.to_vec());
         assert_eq!(fs::read_dir(&d.0).unwrap().count(), 1);
