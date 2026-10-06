@@ -37,6 +37,40 @@ fn assert_no_code(res: &reqwest::Response) {
     }
 }
 
+// ---------------------------------------------------------------- origin
+
+/// The consent form is a plain same-origin form POST. Real browsers attach
+/// `Origin: <issuer>` to it now that pages use `Referrer-Policy: same-origin`
+/// (under `no-referrer` they sent `Origin: null`, which broke the first live
+/// claude.ai approval). `null` and foreign origins stay refused: accepting
+/// `null` would also admit sandboxed frames.
+#[tokio::test]
+async fn consent_accepts_own_origin_and_refuses_null_or_foreign_origin() {
+    let mut h = Harness::start().await;
+    h.enroll().await;
+    let client = h.register_client(CALLBACK).await;
+    let (_, challenge) = pkce();
+    let mut b = Browser::default();
+    let tx = h
+        .begin(&mut b, &client, CALLBACK, "echo", &challenge, "s")
+        .await;
+    assert_eq!(h.owner_login(&mut b, Some(&tx)).await, 200);
+    let csrf = h.consent_csrf(&mut b, &tx).await.expect("form after proof");
+    let form = [
+        ("tx", tx.as_str()),
+        ("csrf", &csrf),
+        ("decision", "approve"),
+    ];
+    for bad in ["null", "https://evil.example"] {
+        let res = h.post_form_origin(&mut b, "/consent", &form, bad).await;
+        assert_eq!(res.status(), 403, "Origin {bad}");
+        assert_no_code(&res);
+    }
+    let res = h.post_form_origin(&mut b, "/consent", &form, ISSUER).await;
+    assert_eq!(res.status(), 303);
+    assert!(location(&res).unwrap().contains("code="));
+}
+
 // ---------------------------------------------------------------- item 1
 
 #[tokio::test]

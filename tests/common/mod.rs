@@ -301,6 +301,30 @@ impl Harness {
         res
     }
 
+    /// `post_form` plus the `Origin` header a browser attaches to a form POST.
+    /// Browsers send the literal `null` when the page's referrer policy is
+    /// `no-referrer` (Fetch: "append a request Origin header"); see `same_origin`.
+    pub async fn post_form_origin(
+        &self,
+        browser: &mut Browser,
+        path: &str,
+        form: &[(&str, &str)],
+        origin: &str,
+    ) -> reqwest::Response {
+        let res = browser
+            .apply(
+                self.http
+                    .post(self.url(path))
+                    .header("origin", origin)
+                    .form(form),
+            )
+            .send()
+            .await
+            .unwrap();
+        browser.absorb(&res);
+        res
+    }
+
     /// Register the first owner passkey with the enrollment code.
     pub async fn enroll(&mut self) {
         let mut browser = Browser::default();
