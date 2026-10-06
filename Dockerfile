@@ -1,5 +1,5 @@
 # Official Rust multi-platform index verified from Docker Hub on 2026-10-05.
-# Tests and final compilation are offline after a locked public-registry fetch.
+# Final compilation is offline after a locked public-registry fetch.
 FROM rust:1.93.0-alpine@sha256:69d7b9d9aeaf108a1419d9a7fcf7860dcc043e9dbd1ab7ce88e44228774d99e9 AS build
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2 \
@@ -14,8 +14,9 @@ COPY tests ./tests
 # config/routes.toml is also compiled into a unit test (include_str!), not only copied into the image.
 COPY config ./config
 RUN cargo fetch --locked
+# The test suite runs before merge (see AGENTS.md), not here: a release-mode test build
+# doubled compile time and memory and got the build killed on the shared Coolify host.
 RUN --network=none set -eu; \
-    cargo test --locked --offline --release --workspace; \
     cargo build --locked --offline --release --bin mcp-edge; \
     readelf -l target/release/mcp-edge > /tmp/program-headers; \
     if grep -q INTERP /tmp/program-headers; then echo 'Refusing dynamically linked binary'; exit 1; fi; \

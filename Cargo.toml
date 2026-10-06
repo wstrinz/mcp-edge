@@ -41,9 +41,10 @@ reqwest = { version = "=0.12.28", default-features = false, features = ["json"] 
 webauthn-authenticator-rs = { version = "=0.5.4", default-features = false, features = ["softpasskey"] }
 
 [profile.release]
-lto = "thin"
+# No LTO and default codegen units: much lower peak memory and build time on the
+# shared Coolify host, for a small service where binary size hardly matters.
+lto = false
 strip = true
-codegen-units = 1
 
 [profile.dev]
 debug = 0
