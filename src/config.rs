@@ -2,7 +2,11 @@
 
 use edge_auth::config::{CLAUDE_CALLBACK, DEFAULT_GRANT_LIFETIME};
 use serde::Deserialize;
-use std::{fmt, net::SocketAddr, path::PathBuf};
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+};
 
 /// Path segments that can never be backend ids.
 const RESERVED: &[&str] = &[
@@ -161,6 +165,92 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
     Ok(routes)
 }
 
+/// Private and loopback ranges: only Coolify's Traefik (on the Docker
+/// network) can reach the container, so these are the proxies by default.
+pub const DEFAULT_TRUSTED_PROXIES: &str =
+    "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,::1/128,fc00::/7";
+
+/// An IP network in CIDR notation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cidr {
+    net: IpAddr,
+    prefix: u8,
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+impl Cidr {
+    pub fn parse(text: &str) -> Option<Self> {
+        let (addr, prefix) = match text.trim().split_once('/') {
+            Some((a, p)) => (a.parse::<IpAddr>().ok()?, p.parse::<u8>().ok()?),
+            None => {
+                let a = text.trim().parse::<IpAddr>().ok()?;
+                (a, if a.is_ipv4() { 32 } else { 128 })
+            }
+        };
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        (prefix <= max).then_some(Self { net: addr, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.net, canonical_ip(ip)) {
+            (IpAddr::V4(n), IpAddr::V4(a)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(n) & mask == u32::from(a) & mask
+            }
+            (IpAddr::V6(n), IpAddr::V6(a)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(n) & mask == u128::from(a) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Comma-separated CIDRs; an empty string trusts no proxy.
+pub fn parse_cidrs(text: &str) -> Result<Vec<Cidr>, ConfigError> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Cidr::parse(s).ok_or_else(|| ConfigError(format!("invalid CIDR {s:?}"))))
+        .collect()
+}
+
+/// The client address for limits. `X-Forwarded-For` is honoured only when the
+/// TCP peer is a trusted proxy; then the right-most hop that is not itself a
+/// trusted proxy is the client. An unparsable hop stops the walk (the chain
+/// beyond it cannot be trusted) and the last trusted address is used.
+pub fn forwarded_client(peer: IpAddr, xff: &[&str], trusted: &[Cidr]) -> IpAddr {
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|c| c.contains(ip));
+    let peer = canonical_ip(peer);
+    if !is_trusted(peer) {
+        return peer;
+    }
+    let mut current = peer;
+    for hop in xff.iter().rev().flat_map(|v| v.rsplit(',')) {
+        let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+            return current;
+        };
+        current = canonical_ip(ip);
+        if !is_trusted(current) {
+            return current;
+        }
+    }
+    current
+}
+
 /// Validated process configuration for edge mode.
 #[derive(Clone, Debug)]
 pub struct EdgeConfig {
@@ -172,7 +262,8 @@ pub struct EdgeConfig {
     pub routes: Vec<Route>,
     pub redirect_allowlist: Vec<String>,
     pub enroll_code: Option<String>,
-    pub trust_forwarded_for: bool,
+    /// Peers whose `X-Forwarded-For` is honoured (Coolify's Traefik).
+    pub trusted_proxies: Vec<Cidr>,
 }
 
 /// Default listener (container port published to Traefik).
@@ -243,11 +334,12 @@ impl EdgeConfig {
             }
         };
         let enroll_code = get("EDGE_ENROLL_CODE").filter(|c| !c.is_empty());
-        let trust_forwarded_for = match get("EDGE_TRUST_FORWARDED_FOR").as_deref() {
-            None | Some("0") | Some("false") => false,
-            Some("1") | Some("true") => true,
-            _ => return err("EDGE_TRUST_FORWARDED_FOR must be 0 or 1"),
-        };
+        if get("EDGE_TRUST_FORWARDED_FOR").is_some() {
+            return err("EDGE_TRUST_FORWARDED_FOR was replaced by EDGE_TRUSTED_PROXIES");
+        }
+        let trusted_proxies = parse_cidrs(
+            &get("EDGE_TRUSTED_PROXIES").unwrap_or_else(|| DEFAULT_TRUSTED_PROXIES.into()),
+        )?;
         let rp_id = get("EDGE_RP_ID").unwrap_or_else(|| host.clone());
         if !(host == rp_id || host.ends_with(&format!(".{rp_id}"))) {
             return err("EDGE_RP_ID must be the public host or a parent domain of it");
@@ -261,7 +353,7 @@ impl EdgeConfig {
             routes,
             redirect_allowlist,
             enroll_code,
-            trust_forwarded_for,
+            trusted_proxies,
         })
     }
 }
@@ -278,6 +370,54 @@ kind = "echo"
 consent = "edge"
 display_name = "Echo"
 "#;
+
+    #[test]
+    fn forwarded_for_is_honoured_only_from_trusted_proxies() {
+        let trusted = parse_cidrs(DEFAULT_TRUSTED_PROXIES).unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Untrusted peer: XFF ignored entirely.
+        assert_eq!(
+            forwarded_client(ip("203.0.113.9"), &["198.51.100.1"], &trusted),
+            ip("203.0.113.9")
+        );
+        // Trusted peer: right-most untrusted hop wins; spoofed left entries ignored.
+        assert_eq!(
+            forwarded_client(ip("10.0.1.2"), &["1.1.1.1, 198.51.100.7"], &trusted),
+            ip("198.51.100.7")
+        );
+        assert_eq!(
+            forwarded_client(
+                ip("10.0.1.2"),
+                &["1.1.1.1", "198.51.100.7, 172.16.0.3"],
+                &trusted
+            ),
+            ip("198.51.100.7")
+        );
+        // No XFF, garbage, or all-trusted chains fall back sensibly.
+        assert_eq!(
+            forwarded_client(ip("10.0.1.2"), &[], &trusted),
+            ip("10.0.1.2")
+        );
+        assert_eq!(
+            forwarded_client(ip("10.0.1.2"), &["1.1.1.1, garbage"], &trusted),
+            ip("10.0.1.2")
+        );
+        assert_eq!(
+            forwarded_client(ip("::ffff:10.0.1.2"), &["192.168.1.1"], &trusted),
+            ip("192.168.1.1")
+        );
+        // Empty list trusts nobody.
+        assert_eq!(
+            forwarded_client(ip("127.0.0.1"), &["198.51.100.7"], &[]),
+            ip("127.0.0.1")
+        );
+        assert!(Cidr::parse("10.0.0.0/33").is_none());
+        assert!(Cidr::parse("fc00::/7").unwrap().contains(ip("fd12::1")));
+        assert!(!Cidr::parse("172.16.0.0/12")
+            .unwrap()
+            .contains(ip("172.32.0.1")));
+        assert!(Cidr::parse("0.0.0.0/0").unwrap().contains(ip("8.8.8.8")));
+    }
 
     #[test]
     fn shipped_route_table_is_valid() {
@@ -323,7 +463,7 @@ display_name = "Echo"
             .unwrap();
         assert_eq!(ok.rp_id, "mcp.app.stri.nz");
         assert_eq!(ok.redirect_allowlist, vec![CLAUDE_CALLBACK]);
-        assert!(!ok.trust_forwarded_for);
+        assert_eq!(ok.trusted_proxies.len(), 6);
         for bad in [
             "http://mcp.app.stri.nz",
             "https://mcp.app.stri.nz/",

@@ -2,7 +2,7 @@
 //! health, and the cross-cutting limits and request log.
 
 use crate::{
-    config::{Route, RouteKind},
+    config::{forwarded_client, Cidr, Route, RouteKind},
     echo::{EchoBackend, SUPPORTED_PROTOCOL_VERSIONS},
 };
 use axum::{
@@ -65,7 +65,8 @@ pub struct AppConfig {
     pub routes: Vec<Route>,
     pub redirect_allowlist: Vec<String>,
     pub enroll_code: Option<String>,
-    pub trust_forwarded_for: bool,
+    /// Peers whose `X-Forwarded-For` is honoured.
+    pub trusted_proxies: Vec<Cidr>,
     pub auth_limits: Limits,
     pub edge_limits: EdgeLimits,
 }
@@ -104,7 +105,7 @@ struct Edge {
     auth: AuthState,
     signer: Signer,
     backends: HashMap<String, Backend>,
-    trust_forwarded_for: bool,
+    trusted_proxies: Vec<Cidr>,
     limits: EdgeLimits,
 }
 
@@ -152,7 +153,7 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
         auth: auth.clone(),
         signer,
         backends,
-        trust_forwarded_for: cfg.trust_forwarded_for,
+        trusted_proxies: cfg.trusted_proxies,
         limits: cfg.edge_limits,
     });
     let gateway = Router::new()
@@ -207,25 +208,20 @@ async fn assertion_key(State(edge): State<Arc<Edge>>) -> Response {
     .into_response()
 }
 
-/// Client address for limits: the TCP peer, or — only when explicitly
-/// configured behind the proxy — the right-most `X-Forwarded-For` entry, which
-/// is the address the proxy itself observed.
+/// Client address for limits: the TCP peer, or, when the peer is a trusted
+/// proxy, the right-most untrusted `X-Forwarded-For` hop.
 fn client_ip(edge: &Edge, req: &Request) -> Option<IpAddr> {
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip());
-    if !edge.trust_forwarded_for {
-        return peer;
-    }
-    req.headers()
+        .map(|c| c.0.ip())?;
+    let xff: Vec<&str> = req
+        .headers()
         .get_all("x-forwarded-for")
         .iter()
-        .next_back()
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .or(peer)
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    Some(forwarded_client(peer, &xff, &edge.trusted_proxies))
 }
 
 /// Pre-routing guard: refuse proxy-style requests, apply the per-IP limit and

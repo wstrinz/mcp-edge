@@ -234,8 +234,10 @@ below was taken.
   unverified one instead of answering 429 (found in review: a refusing cap let one
   anonymous IP lock the owner out of login and consent). A response cap is not needed for the in-binary echo and
   belongs to the HTTP forwarder in phase 3.
-- Client IP is the TCP peer unless `EDGE_TRUST_FORWARDED_FOR=1`, then the right-most
-  `X-Forwarded-For` entry (the address Traefik saw). IPv6 is limited per /64. The
+- Client IP is the TCP peer. Only when the peer is inside `EDGE_TRUSTED_PROXIES`
+  (default RFC 1918, loopback and `fc00::/7`, since only Coolify's Traefik can reach
+  the container) is `X-Forwarded-For` read, taking the right-most hop that is not a
+  trusted proxy; an unparsable hop ends the walk. IPv6 is limited per /64. The
   limiter holds at most 10 000 keys; when all are live, new keys are refused for the
   rest of the window (fail closed, a bounded DoS trade-off).
 - Logs: one line per request (method, route template, status, ms, backend, grant id)

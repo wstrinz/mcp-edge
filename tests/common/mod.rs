@@ -11,7 +11,7 @@ use edge_auth::{
 };
 use mcp_edge::{
     app::{self, AppConfig, AppDeps, EdgeLimits},
-    config::parse_routes,
+    config::{parse_cidrs, parse_routes},
     server::serve,
 };
 use serde_json::{json, Value};
@@ -80,9 +80,29 @@ impl Default for Options {
 #[derive(Default, Clone)]
 pub struct Browser {
     pub cookies: HashMap<String, String>,
+    /// Simulated client address, sent as `X-Forwarded-For` (loopback is a
+    /// trusted proxy in the harness).
+    pub from: Option<String>,
 }
 
 impl Browser {
+    pub fn from_ip(ip: &str) -> Self {
+        Self {
+            from: Some(ip.to_string()),
+            ..Self::default()
+        }
+    }
+
+    pub fn apply(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(c) = self.header() {
+            req = req.header("cookie", c);
+        }
+        if let Some(ip) = &self.from {
+            req = req.header("x-forwarded-for", ip);
+        }
+        req
+    }
+
     pub fn header(&self) -> Option<String> {
         if self.cookies.is_empty() {
             return None;
@@ -185,7 +205,7 @@ impl Harness {
                 routes: parse_routes(ROUTES).unwrap(),
                 redirect_allowlist: vec![CALLBACK.into(), OTHER_CALLBACK.into()],
                 enroll_code: opts.enroll_code,
-                trust_forwarded_for: false,
+                trusted_proxies: parse_cidrs("127.0.0.0/8").unwrap(),
                 auth_limits: opts.auth_limits,
                 edge_limits: opts.edge_limits,
             },
@@ -237,11 +257,11 @@ impl Harness {
     }
 
     pub async fn get(&self, browser: &mut Browser, path: &str) -> reqwest::Response {
-        let mut req = self.http.get(self.url(path));
-        if let Some(c) = browser.header() {
-            req = req.header("cookie", c);
-        }
-        let res = req.send().await.unwrap();
+        let res = browser
+            .apply(self.http.get(self.url(path)))
+            .send()
+            .await
+            .unwrap();
         browser.absorb(&res);
         res
     }
@@ -252,15 +272,16 @@ impl Harness {
         path: &str,
         body: &Value,
     ) -> reqwest::Response {
-        let mut req = self
-            .http
-            .post(self.url(path))
-            .header("content-type", "application/json")
-            .body(serde_json::to_vec(body).unwrap());
-        if let Some(c) = browser.header() {
-            req = req.header("cookie", c);
-        }
-        let res = req.send().await.unwrap();
+        let res = browser
+            .apply(
+                self.http
+                    .post(self.url(path))
+                    .header("content-type", "application/json")
+                    .body(serde_json::to_vec(body).unwrap()),
+            )
+            .send()
+            .await
+            .unwrap();
         browser.absorb(&res);
         res
     }
@@ -271,11 +292,11 @@ impl Harness {
         path: &str,
         form: &[(&str, &str)],
     ) -> reqwest::Response {
-        let mut req = self.http.post(self.url(path)).form(form);
-        if let Some(c) = browser.header() {
-            req = req.header("cookie", c);
-        }
-        let res = req.send().await.unwrap();
+        let res = browser
+            .apply(self.http.post(self.url(path)).form(form))
+            .send()
+            .await
+            .unwrap();
         browser.absorb(&res);
         res
     }

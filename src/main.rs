@@ -137,7 +137,7 @@ async fn run_edge() {
             routes: cfg.routes,
             redirect_allowlist: cfg.redirect_allowlist,
             enroll_code: cfg.enroll_code,
-            trust_forwarded_for: cfg.trust_forwarded_for,
+            trusted_proxies: cfg.trusted_proxies,
             auth_limits: Limits::default(),
             edge_limits: EdgeLimits::default(),
         },

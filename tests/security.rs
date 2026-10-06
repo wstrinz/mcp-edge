@@ -724,6 +724,27 @@ async fn limits_methods_and_fixed_errors() {
         statuses.push(res.status().as_u16());
     }
     assert_eq!(statuses, vec![201, 201, 429]);
+    // Behind a trusted proxy (loopback here) another client network has its
+    // own budget; spoofed left-hand X-Forwarded-For entries do not help.
+    let mut statuses = Vec::new();
+    for xff in [
+        "198.51.100.1",
+        "198.51.100.1",
+        "198.51.100.1",
+        "6.6.6.6, 198.51.100.1",
+        "6.6.6.6, 198.51.100.1, 127.0.0.2",
+    ] {
+        let res = h
+            .http
+            .post(h.url("/register"))
+            .header("x-forwarded-for", xff)
+            .json(&json!({ "redirect_uris": [CALLBACK] }))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(res.status().as_u16());
+    }
+    assert_eq!(statuses, vec![201, 201, 201, 429, 429]);
 
     // Body cap (echo2: 4096 bytes) is enforced after authentication.
     let big = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping", "params": { "pad": "x".repeat(5000) } });

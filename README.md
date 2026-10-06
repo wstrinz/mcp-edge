@@ -51,7 +51,7 @@ and exposes one tool, `whoami`, returning the verified claims.
 | `EDGE_ROUTES` | `/etc/mcp-edge/routes.toml` | Route table ([config/routes.toml](config/routes.toml) is baked into the image) |
 | `EDGE_ENROLL_CODE` | unset | One-time code (≥ 16 ASCII chars) authorizing the **first** owner passkey. Consumed on use; remove it afterwards |
 | `EDGE_REDIRECT_ALLOWLIST` | `https://claude.ai/api/mcp/auth_callback` | Comma-separated exact https redirect URIs clients may register |
-| `EDGE_TRUST_FORWARDED_FOR` | `0` | `1` = use the right-most `X-Forwarded-For` entry (the proxy's view) for per-IP limits. Only behind Traefik |
+| `EDGE_TRUSTED_PROXIES` | RFC 1918 + loopback + `fc00::/7` | Comma-separated CIDRs. `X-Forwarded-For` is honoured only when the TCP peer is in this list; the right-most hop outside it is the client used for per-IP limits. Empty = never trust the header |
 | `EDGE_RP_ID` | public host | WebAuthn RP id (the host or a parent domain) |
 | `EDGE_RP_NAME` | `mcp-edge` | WebAuthn RP display name |
 

@@ -20,7 +20,6 @@ services:
       EDGE_BIND: 0.0.0.0:8080
       EDGE_DATA_DIR: /data
       EDGE_ROUTES: /etc/mcp-edge/routes.toml
-      EDGE_TRUST_FORWARDED_FOR: "1"
       EDGE_ENROLL_CODE: ${EDGE_ENROLL_CODE:-}
     expose:
       - "8080"
