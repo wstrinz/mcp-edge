@@ -7,7 +7,9 @@ and publication on 2026-10-05. Coolify setup and deployment remain pending.
 The intended service gives ordinary HTTPS MCP clients an optional route to an
 online local Wiskit instance through iroh. Local use, peer sync and data recovery
 must remain independent of the edge. The production Wiskit adapter and OAuth
-integration are still pending; see [the builder handoff](docs/BUILDER-HANDOFF.md).
+integration are still pending. **Current plan: [docs/DESIGN.md](docs/DESIGN.md)**: a generic, OAuth-hardened
+front door for all the owner's MCP servers, with Wiskit as the first iroh backend. The
+[builder handoff](docs/BUILDER-HANDOFF.md) still holds its safety rules and Wiskit details.
 
 ## What is implemented
 
