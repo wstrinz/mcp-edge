@@ -111,13 +111,36 @@ pub enum RefreshOutcome {
     },
     Missing,
     /// A rotated token was presented again (or by another client): the whole
-    /// grant was revoked.
-    FamilyRevoked(String),
+    /// grant was revoked (`Some` when this call changed its state).
+    FamilyRevoked(String, Option<Revoked>),
     Inactive,
+}
+
+/// A grant this call moved to `revoked`: its backend and the `gen` it had
+/// while live (the value its assertions carried).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Revoked {
+    pub id: String,
+    pub backend: String,
+    pub gen: i64,
 }
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+/// Columns added after phase 2 (existing databases are upgraded in place).
+fn migrate(conn: &Connection) -> StoreResult<()> {
+    let has_approval: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('grants') WHERE name = 'approval'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_approval == 0 {
+        // Phase 4: the origin's signed approval, kept as evidence.
+        conn.execute_batch("ALTER TABLE grants ADD COLUMN approval TEXT")?;
+    }
+    Ok(())
 }
 
 fn grant_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
@@ -151,6 +174,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -446,6 +470,10 @@ impl Store {
 
     // ---- grants and codes ----
 
+    /// Create a pending grant and its one-use code in one transaction.
+    /// `resource_scope` is the JSON object assertions carry (`{}` for edge
+    /// consent; the origin-approved scope for origin consent) and `approval`
+    /// the origin's signed approval, stored as evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn create_grant_with_code(
         &self,
@@ -453,6 +481,8 @@ impl Store {
         client_id: &str,
         backend: &str,
         scope: &str,
+        resource_scope: &str,
+        approval: Option<&str>,
         grant_expires: i64,
         code_hash: &str,
         redirect_uri: &str,
@@ -464,8 +494,17 @@ impl Store {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO grants (id, client_id, backend, scope, resource_scope, created, expires,
-                status, gen) VALUES (?1, ?2, ?3, ?4, '{}', ?5, ?6, 'pending', 1)",
-            params![grant_id, client_id, backend, scope, now, grant_expires],
+                status, gen, approval) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 1, ?8)",
+            params![
+                grant_id,
+                client_id,
+                backend,
+                scope,
+                resource_scope,
+                now,
+                grant_expires,
+                approval
+            ],
         )?;
         tx.execute(
             "INSERT INTO codes (hash, grant_id, client_id, redirect_uri, challenge, backend, expires)
@@ -604,9 +643,9 @@ impl Store {
         };
         let replay = status != "active" && grace_successor.is_none();
         if replay || grant.client_id != client_id {
-            revoke_grant_tx(&tx, &grant_id)?;
+            let revoked = revoke_grant_tx(&tx, &grant_id)?;
             tx.commit()?;
-            return Ok(RefreshOutcome::FamilyRevoked(grant_id));
+            return Ok(RefreshOutcome::FamilyRevoked(grant_id, revoked));
         }
         if grant.status != "active" || grant.expires <= now {
             return Ok(RefreshOutcome::Inactive);
@@ -707,7 +746,8 @@ impl Store {
         .optional()
     }
 
-    pub fn revoke_grant(&self, grant_id: &str) -> StoreResult<bool> {
+    /// Revoke one grant (gen++). `Some` when this call changed its state.
+    pub fn revoke_grant(&self, grant_id: &str) -> StoreResult<Option<Revoked>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let changed = revoke_grant_tx(&tx, grant_id)?;
@@ -715,7 +755,7 @@ impl Store {
         Ok(changed)
     }
 
-    pub fn revoke_all_grants(&self) -> StoreResult<Vec<String>> {
+    pub fn revoke_all_grants(&self) -> StoreResult<Vec<Revoked>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let ids: Vec<String> = {
@@ -724,11 +764,89 @@ impl Store {
             let rows = stmt.query_map([], |r| r.get(0))?;
             rows.collect::<Result<_, _>>()?
         };
+        let mut out = Vec::new();
         for id in &ids {
-            revoke_grant_tx(&tx, id)?;
+            if let Some(r) = revoke_grant_tx(&tx, id)? {
+                out.push(r);
+            }
         }
         tx.commit()?;
-        Ok(ids)
+        Ok(out)
+    }
+
+    /// Active, unexpired grants of one backend: `(id, gen)`, oldest first.
+    pub fn live_grants_for_backend(
+        &self,
+        backend: &str,
+        now: i64,
+    ) -> StoreResult<Vec<(String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, gen FROM grants WHERE backend = ?1 AND status = 'active' AND expires > ?2
+                ORDER BY created, id",
+        )?;
+        let rows = stmt.query_map(params![backend, now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Grants that ended without a revocation: active grants whose absolute
+    /// lifetime passed in `(since, now]`, and pending grants (code never
+    /// exchanged) that [`Store::cleanup`] is about to delete.
+    pub fn ended_without_revocation(&self, since: i64, now: i64) -> StoreResult<Vec<Revoked>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, backend, gen FROM grants
+                WHERE (status = 'active' AND expires > ?1 AND expires <= ?2)
+                   OR (status = 'pending' AND created <= ?3)",
+        )?;
+        let rows = stmt.query_map(params![since, now, now - 3600], |r| {
+            Ok(Revoked {
+                id: r.get(0)?,
+                backend: r.get(1)?,
+                gen: r.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Record the origin EndpointId configured for `backend` (meta
+    /// `origin:<backend>`). If it differs from the stored one (or none was
+    /// stored), every live grant of the backend is revoked (gen++) and the new
+    /// id stored, in one transaction. Returns whether a different id was
+    /// stored before, and the revoked grants.
+    pub fn bind_origin(
+        &self,
+        backend: &str,
+        origin_id: &str,
+    ) -> StoreResult<(bool, Vec<Revoked>)> {
+        let key = format!("origin:{backend}");
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let stored: Option<String> = tx
+            .query_row("SELECT v FROM meta WHERE k = ?1", [&key], |r| r.get(0))
+            .optional()?;
+        if stored.as_deref() == Some(origin_id) {
+            return Ok((false, Vec::new()));
+        }
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM grants WHERE backend = ?1 AND status IN ('active', 'pending')",
+            )?;
+            let rows = stmt.query_map([backend], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut revoked = Vec::new();
+        for id in &ids {
+            if let Some(r) = revoke_grant_tx(&tx, id)? {
+                revoked.push(r);
+            }
+        }
+        tx.execute(
+            "INSERT INTO meta (k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![key, origin_id],
+        )?;
+        tx.commit()?;
+        Ok((stored.is_some(), revoked))
     }
 
     pub fn active_grants(&self, now: i64) -> StoreResult<Vec<(GrantRow, Option<String>)>> {
@@ -771,8 +889,18 @@ impl Store {
     }
 }
 
-fn revoke_grant_tx(tx: &rusqlite::Transaction<'_>, grant_id: &str) -> StoreResult<bool> {
-    let n = tx.execute(
+fn revoke_grant_tx(
+    tx: &rusqlite::Transaction<'_>,
+    grant_id: &str,
+) -> StoreResult<Option<Revoked>> {
+    let live: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT backend, gen FROM grants WHERE id = ?1 AND status IN ('active', 'pending')",
+            [grant_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    tx.execute(
         "UPDATE grants SET status = 'revoked', gen = gen + 1
             WHERE id = ?1 AND status IN ('active', 'pending')",
         [grant_id],
@@ -783,7 +911,11 @@ fn revoke_grant_tx(tx: &rusqlite::Transaction<'_>, grant_id: &str) -> StoreResul
         [grant_id],
     )?;
     tx.execute("UPDATE codes SET used = 1 WHERE grant_id = ?1", [grant_id])?;
-    Ok(n == 1)
+    Ok(live.map(|(backend, gen)| Revoked {
+        id: grant_id.to_owned(),
+        backend,
+        gen,
+    }))
 }
 
 #[cfg(test)]
@@ -803,6 +935,8 @@ mod tests {
                 "c",
                 "echo",
                 "mcp",
+                "{}",
+                None,
                 t0 + 86_400,
                 "code",
                 "https://cb.test/",

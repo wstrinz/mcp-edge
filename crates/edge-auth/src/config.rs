@@ -25,6 +25,10 @@ pub const MIN_ENROLL_CODE_LEN: usize = 16;
 pub enum ConsentMode {
     /// The edge's own consent page is sufficient.
     Edge,
+    /// The local app (origin) decides: after the owner's passkey proof the
+    /// edge asks the origin through [`crate::origin::OriginPort`] and issues a
+    /// code only for a verified approval, with the approved resource scope.
+    Origin,
 }
 
 /// The authorization-relevant part of one route-table entry.
@@ -59,6 +63,11 @@ pub struct Limits {
     pub max_enroll_failures: u32,
     /// Wrong enrollment codes across all networks per hour.
     pub max_enroll_failures_global: u32,
+    /// Origin consent: how long the edge waits for the app owner's decision
+    /// (seconds, 1..=180; PHASE4.md §3.2).
+    pub origin_consent_secs: u64,
+    /// Origin consent: attempts per pending request (each with a new code).
+    pub origin_consent_attempts: u32,
 }
 
 impl Default for Limits {
@@ -74,6 +83,8 @@ impl Default for Limits {
             max_clients: 100,
             max_enroll_failures: 10,
             max_enroll_failures_global: 100,
+            origin_consent_secs: 180,
+            origin_consent_attempts: 3,
         }
     }
 }

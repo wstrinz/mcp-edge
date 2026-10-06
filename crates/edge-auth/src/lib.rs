@@ -15,6 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod config;
+pub mod origin;
 pub mod owner;
 mod pages;
 mod store;
@@ -35,9 +36,10 @@ use axum::{
     Extension, Router,
 };
 use config::{
-    AuthConfig, ACCESS_TTL, CEREMONY_TTL, CODE_TTL, FRESH_PROOF, MIN_ENROLL_CODE_LEN, PENDING_TTL,
-    SESSION_TTL,
+    AuthConfig, ConsentMode, ACCESS_TTL, CEREMONY_TTL, CODE_TTL, FRESH_PROOF, MIN_ENROLL_CODE_LEN,
+    PENDING_TTL, SESSION_TTL,
 };
+use origin::{ConsentAsk, ConsentOutcome, OriginPort, RevokeReason};
 use owner::{CeremonyState, OwnerProof};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,11 +47,12 @@ use std::{
     collections::HashMap,
     path::Path as FsPath,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
     },
 };
-use store::{CodeTake, PendingRow, RefreshOutcome, Store};
+use store::{CodeTake, PendingRow, RefreshOutcome, Revoked, Store};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use support::{
     ct_eq, hash_secret, hmac_b64, is_b64url, parse_unique_params, pkce_s256_matches, random_bytes,
     random_id, random_secret, valid_verifier, ClientIp, Clock, LogSink, RateLimiter,
@@ -157,6 +160,52 @@ struct Inner {
     issuer_origin: String,
     issuer_host: String,
     csp: String,
+    /// The gateway's side of `consent = "origin"` backends (weak: the gateway
+    /// owns this state, not the other way round).
+    origin_port: OnceLock<Weak<dyn OriginPort>>,
+    /// Origin consent attempts by pending-request id. In memory only: the
+    /// tunnel stream that carries a consent request does not survive a restart
+    /// either, and pairing codes never touch the disk.
+    origin_txs: Mutex<HashMap<String, OriginTx>>,
+    /// Upper end of the last scan for grants that ended without revocation.
+    expiry_scan: AtomicI64,
+}
+
+/// Where one origin consent attempt stands (PHASE4.md §3.2).
+#[derive(Clone, Debug)]
+enum OriginStage {
+    Sent,
+    Unreachable(&'static str),
+    Approved {
+        resource_scope: Value,
+        lifetime_secs: u64,
+        approval: String,
+        at: i64,
+    },
+    Denied,
+    Timeout,
+}
+
+impl OriginStage {
+    fn name(&self) -> &'static str {
+        match self {
+            OriginStage::Sent => "sent",
+            OriginStage::Unreachable(_) => "origin_unreachable",
+            OriginStage::Approved { .. } => "approved",
+            OriginStage::Denied => "denied",
+            OriginStage::Timeout => "origin_timeout",
+        }
+    }
+}
+
+struct OriginTx {
+    stage: OriginStage,
+    /// Attempts made so far (each with a fresh code, grant id and nonce).
+    attempts: u32,
+    pairing_code: String,
+    grant_id: String,
+    started: i64,
+    task: Option<tokio::task::AbortHandle>,
 }
 
 /// Shared authorization-server state. Cheap to clone.
@@ -344,8 +393,13 @@ impl AuthState {
             }
             ok
         });
+        let lim = &config.limits;
+        if !(1..=180).contains(&lim.origin_consent_secs) || lim.origin_consent_attempts == 0 {
+            return Err(InitError::Config("origin consent limits"));
+        }
         let store = Store::open(db_path).map_err(InitError::Store)?;
         let owner_id = store.owner_id(new_uuid_v4).map_err(InitError::Store)?;
+        let started = clock.now();
         let csp = format!(
             "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
              img-src 'self'; form-action {}; frame-ancestors 'none'; base-uri 'none'",
@@ -367,7 +421,96 @@ impl AuthState {
             enroll_failures: Mutex::new(EnrollFailures::default()),
             owner_id,
             csp,
+            origin_port: OnceLock::new(),
+            origin_txs: Mutex::new(HashMap::new()),
+            expiry_scan: AtomicI64::new(started),
         })))
+    }
+
+    /// Connect the gateway for `consent = "origin"` backends. Only the first
+    /// call has an effect; the state keeps a weak reference.
+    pub fn set_origin_port(&self, port: Weak<dyn OriginPort>) {
+        let _ = self.0.origin_port.set(port);
+    }
+
+    fn origin_port(&self) -> Option<Arc<dyn OriginPort>> {
+        self.0.origin_port.get().and_then(Weak::upgrade)
+    }
+
+    fn is_origin_backend(&self, backend: &str) -> bool {
+        self.config()
+            .backend(backend)
+            .is_some_and(|b| b.consent == ConsentMode::Origin)
+    }
+
+    /// Tell the origin (best effort) that the edge ended these grants.
+    fn notify_revoked(&self, revoked: &[Revoked], reason: RevokeReason) {
+        let Some(port) = self.origin_port() else {
+            return;
+        };
+        for r in revoked {
+            if self.is_origin_backend(&r.backend) {
+                port.revoked(
+                    &r.backend,
+                    &r.id,
+                    u64::try_from(r.gen).unwrap_or(0),
+                    reason,
+                );
+            }
+        }
+    }
+
+    /// Record the configured origin EndpointId of an origin backend at start
+    /// (PHASE4.md §1.2). A different id than the stored one revokes every
+    /// grant of the backend (gen++) and logs `event=origin_reenrolled`; no
+    /// grant ever moves silently to a new origin.
+    pub fn bind_origin(&self, backend: &str, origin_id: &str) -> Result<(), InitError> {
+        let (changed, revoked) = self
+            .0
+            .store
+            .bind_origin(backend, origin_id)
+            .map_err(InitError::Store)?;
+        if changed {
+            self.log(&format!(
+                "event=origin_reenrolled backend={backend} revoked={}",
+                revoked.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Active grants of `backend` as `(grant_id, gen)` (for `grant_sync`).
+    pub fn live_grants(&self, backend: &str) -> Vec<(String, u64)> {
+        match self.0.store.live_grants_for_backend(backend, self.now()) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|(id, gen)| (id, u64::try_from(gen).unwrap_or(0)))
+                .collect(),
+            Err(_) => {
+                self.log("event=store_error op=live_grants");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Revoke a grant because its origin no longer honours it (a refusal such
+    /// as `grant_revoked`, or `grant_sync`). The origin is not notified: it
+    /// already knows. Logs `event=<event> grant=<id>` when the state changed.
+    pub fn revoke_for_origin(&self, grant_id: &str, event: &str) -> bool {
+        match self.0.store.revoke_grant(grant_id) {
+            Ok(Some(r)) => {
+                self.log(&format!(
+                    "event={event} backend={} grant={grant_id}",
+                    r.backend
+                ));
+                true
+            }
+            Ok(None) => false,
+            Err(_) => {
+                self.log("event=store_error op=revoke");
+                false
+            }
+        }
     }
 
     pub fn config(&self) -> &AuthConfig {
@@ -399,6 +542,16 @@ impl AuthState {
     /// Remove expired state (call periodically).
     pub fn cleanup(&self) {
         let now = self.now();
+        let since = self.0.expiry_scan.swap(now, Ordering::SeqCst);
+        match self.0.store.ended_without_revocation(since, now) {
+            Ok(ended) => self.notify_revoked(&ended, RevokeReason::Expired),
+            Err(_) => self.log("event=store_error op=expiry_scan"),
+        }
+        self.0
+            .origin_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, t| t.started + PENDING_TTL > now);
         if self.0.store.cleanup(now).is_err() {
             self.log("event=store_error op=cleanup");
         }
@@ -646,6 +799,10 @@ pub fn router(state: AuthState) -> Router {
             "/consent",
             get(consent_page).post(consent_submit).layer(small),
         )
+        .route("/consent/start", post(consent_start).layer(small))
+        .route("/consent/status", get(consent_status))
+        .route("/consent/finish", post(consent_finish).layer(small))
+        .route("/consent/cancel", post(consent_cancel).layer(small))
         .route("/token", post(token).layer(small))
         .route("/revoke", post(revoke).layer(small))
         .route("/owner", get(owner_home))
@@ -957,6 +1114,35 @@ async fn consent_page(
     blocking(move || consent_page_inner(&s, &headers, query.as_deref().unwrap_or(""))).await
 }
 
+fn proof_is_fresh(p: &PendingRow, now: i64) -> bool {
+    p.verified_at
+        .is_some_and(|t| t <= now && now - t <= FRESH_PROOF)
+}
+
+/// Plain-language text for an origin consent failure reason.
+fn origin_reason_text(reason: &str, app: &str) -> String {
+    match reason {
+        "origin_offline" | "origin_unavailable" => format!(
+            "{app} is not reachable: the computer it runs on is off or asleep, or the app is \
+             closed."
+        ),
+        "origin_remote_off" => format!("Remote access is turned off in {app}."),
+        "origin_unenrolled" | "origin_rejected_edge" => format!(
+            "{app} does not recognize this edge. Paste the enrollment string from /owner into \
+             {app} and try again."
+        ),
+        "origin_locked" => format!("{app} is locked or not ready yet. Unlock it and try again."),
+        "origin_paused" => format!("Remote access in {app} is paused (its audit log failed)."),
+        "consent_busy" => format!("{app} is already showing another access request."),
+        "origin_busy" => format!("{app} is busy. Try again in a moment."),
+        "approval_invalid" => format!(
+            "{app}'s answer could not be verified, so it was not accepted. Check the enrollment \
+             on both sides."
+        ),
+        _ => format!("{app} could not be asked."),
+    }
+}
+
 fn consent_page_inner(s: &AuthState, headers: &HeaderMap, query: &str) -> HandlerResult {
     let params = parse_unique_params(query.as_bytes()).unwrap_or_default();
     let tx = params.get("tx").map(String::as_str).unwrap_or("");
@@ -970,10 +1156,42 @@ fn consent_page_inner(s: &AuthState, headers: &HeaderMap, query: &str) -> Handle
         )
     })?;
     let now = s.now();
-    let fresh = p
-        .verified_at
-        .is_some_and(|t| t <= now && now - t <= FRESH_PROOF);
-    let csrf = fresh.then(|| s.consent_csrf(&p.id, &binding));
+    let fresh = proof_is_fresh(&p, now);
+    let is_origin = backend.consent == ConsentMode::Origin;
+    // Origin backends need CSRF tokens for cancel/finish even after the
+    // passkey proof aged; starting (or retrying) still requires a fresh proof.
+    let csrf = (fresh || is_origin).then(|| s.consent_csrf(&p.id, &binding));
+    let max_attempts = s.config().limits.origin_consent_attempts;
+    let origin = is_origin.then(|| {
+        let txs = s.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
+        match txs.get(&p.id) {
+            None => pages::OriginPage::Ready {
+                attempts_left: max_attempts,
+                reason: None,
+            },
+            Some(t) => {
+                let left = max_attempts.saturating_sub(t.attempts);
+                match &t.stage {
+                    OriginStage::Sent => pages::OriginPage::Sent {
+                        pairing_code: t.pairing_code.clone(),
+                    },
+                    OriginStage::Unreachable(r) => pages::OriginPage::Ready {
+                        attempts_left: left,
+                        reason: Some(origin_reason_text(r, &backend.display_name)),
+                    },
+                    OriginStage::Approved { .. } => pages::OriginPage::Approved,
+                    OriginStage::Denied => pages::OriginPage::Ended {
+                        title: "Denied",
+                        text: format!("The request was denied in {}.", backend.display_name),
+                    },
+                    OriginStage::Timeout => pages::OriginPage::Ended {
+                        title: "No decision",
+                        text: format!("No decision was made in {} in time.", backend.display_name),
+                    },
+                }
+            }
+        }
+    });
     let redirect_host = Url::parse(&p.redirect_uri)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
@@ -995,8 +1213,80 @@ fn consent_page_inner(s: &AuthState, headers: &HeaderMap, query: &str) -> Handle
             .unwrap_or_else(|| "unknown".into()),
         issuer_host: &s.0.issuer_host,
         csrf: csrf.as_deref(),
+        fresh,
+        origin,
     };
     Ok(s.html(StatusCode::OK, pages::consent(&view)))
+}
+
+/// Deny: one-shot consume, then redirect `access_denied` to the client.
+fn deny_redirect(s: &AuthState, p: &PendingRow, now: i64, bad: Response) -> HandlerResult {
+    if !s.db("pending", s.0.store.consume_pending(&p.id, now))? {
+        return Err(bad);
+    }
+    s.log("event=consent_denied");
+    let iss = s.config().issuer.clone();
+    let mut res = redirect_with(
+        &p.redirect_uri,
+        &[
+            ("error", "access_denied"),
+            ("state", &p.state),
+            ("iss", &iss),
+        ],
+    );
+    res.headers_mut()
+        .append(SET_COOKIE, cookie_header(TX_COOKIE, "", 0));
+    Ok(res)
+}
+
+/// Approve: one-shot consume, then create the grant and its one-use code
+/// atomically and redirect with `code`, `state`, `iss`.
+#[allow(clippy::too_many_arguments)]
+fn issue_code(
+    s: &AuthState,
+    p: &PendingRow,
+    backend: &str,
+    grant_id: &str,
+    resource_scope: &str,
+    approval: Option<&str>,
+    grant_expires: i64,
+    now: i64,
+    bad: Response,
+) -> HandlerResult {
+    if !s.db("pending", s.0.store.consume_pending(&p.id, now))? {
+        return Err(bad);
+    }
+    let code = random_secret("mec_");
+    s.db(
+        "grant",
+        s.0.store.create_grant_with_code(
+            grant_id,
+            &p.client_id,
+            backend,
+            &p.scope,
+            resource_scope,
+            approval,
+            grant_expires,
+            &hash_secret(&code),
+            &p.redirect_uri,
+            &p.code_challenge,
+            now + CODE_TTL,
+            now,
+        ),
+    )?;
+    s.log(&format!(
+        "event=consent_approved grant={grant_id} backend={backend}"
+    ));
+    let iss = s.config().issuer.clone();
+    let mut res = redirect_with(
+        &p.redirect_uri,
+        &[("code", &code), ("state", &p.state), ("iss", &iss)],
+    );
+    res.extensions_mut()
+        .insert(LoggedGrant(grant_id.to_owned()));
+    res.headers_mut()
+        .append(SET_COOKIE, cookie_header(TX_COOKIE, "", 0));
+    Ok(res)
 }
 
 async fn consent_submit(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1020,10 +1310,7 @@ fn consent_submit_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Hand
         return Err(bad());
     }
     let now = s.now();
-    let fresh = p
-        .verified_at
-        .is_some_and(|t| t <= now && now - t <= FRESH_PROOF);
-    if !fresh {
+    if !proof_is_fresh(&p, now) {
         return Err(s.page_error(
             StatusCode::FORBIDDEN,
             "Passkey required",
@@ -1034,53 +1321,387 @@ fn consent_submit_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Hand
     if !matches!(decision, Some("approve") | Some("deny")) {
         return Err(bad());
     }
-    if !s.db("pending", s.0.store.consume_pending(&p.id, now))? {
-        return Err(bad());
+    let backend = s.config().backend(&p.backend).ok_or_else(bad)?;
+    if backend.consent == ConsentMode::Origin {
+        // Only the app can approve an origin backend; the edge page can deny.
+        if decision == Some("approve") {
+            return Err(s.page_error(
+                StatusCode::BAD_REQUEST,
+                "Approve in the app",
+                "This backend is approved in its own app, not on this page.",
+            ));
+        }
+        s.cancel_origin_attempt(&p.id);
+        return deny_redirect(s, &p, now, bad());
     }
-    let iss = s.config().issuer.clone();
-    let mut res = if decision == Some("approve") {
-        let backend = s.config().backend(&p.backend).ok_or_else(bad)?;
-        let grant_id = random_id("g_");
-        let code = random_secret("mec_");
-        s.db(
-            "grant",
-            s.0.store.create_grant_with_code(
-                &grant_id,
-                &p.client_id,
-                &backend.id,
-                &p.scope,
-                now + backend.grant_lifetime_secs,
-                &hash_secret(&code),
-                &p.redirect_uri,
-                &p.code_challenge,
-                now + CODE_TTL,
-                now,
-            ),
-        )?;
-        s.log(&format!(
-            "event=consent_approved grant={grant_id} backend={}",
-            backend.id
+    if decision == Some("deny") {
+        return deny_redirect(s, &p, now, bad());
+    }
+    let grant_id = random_id("g_");
+    issue_code(
+        s,
+        &p,
+        &backend.id,
+        &grant_id,
+        "{}",
+        None,
+        now + backend.grant_lifetime_secs,
+        now,
+        bad(),
+    )
+}
+
+// ---------------------------------------------------------- origin consent
+
+/// 6 Crockford base32 characters (30 random bits).
+fn pairing_code() -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let n = u32::from_be_bytes(random_bytes::<4>());
+    (0..6)
+        .map(|i| char::from(ALPHABET[((n >> (i * 5)) & 31) as usize]))
+        .collect()
+}
+
+impl AuthState {
+    /// Stop a running origin consent attempt (the dropped stream makes the
+    /// origin close its prompt) and forget the attempt.
+    fn cancel_origin_attempt(&self, tx: &str) {
+        let removed = self
+            .0
+            .origin_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(tx);
+        if let Some(t) = removed {
+            if let Some(task) = t.task {
+                task.abort();
+            }
+            if matches!(t.stage, OriginStage::Sent) {
+                self.log("event=consent_cancelled");
+            }
+        }
+    }
+
+    /// Record the outcome of attempt number `attempt` of `tx`, unless the
+    /// attempt was cancelled or superseded meanwhile.
+    fn finish_origin_attempt(&self, tx: &str, attempt: u32, outcome: ConsentOutcome) {
+        let now = self.now();
+        let mut txs = self.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(t) = txs.get_mut(tx) else {
+            return;
+        };
+        if t.attempts != attempt || !matches!(t.stage, OriginStage::Sent) {
+            return;
+        }
+        t.task = None;
+        let grant = t.grant_id.clone();
+        t.stage = match outcome {
+            ConsentOutcome::Approved {
+                resource_scope,
+                lifetime_secs,
+                approval,
+            } if resource_scope.is_object() && lifetime_secs > 0 => {
+                self.log(&format!("event=consent_origin_approved grant={grant}"));
+                OriginStage::Approved {
+                    resource_scope,
+                    lifetime_secs,
+                    approval,
+                    at: now,
+                }
+            }
+            ConsentOutcome::Approved { .. } => {
+                self.log("event=origin_approval_invalid reason=scope");
+                OriginStage::Unreachable("approval_invalid")
+            }
+            ConsentOutcome::Denied => {
+                self.log("event=consent_origin_denied");
+                OriginStage::Denied
+            }
+            ConsentOutcome::Timeout => {
+                self.log("event=consent_origin_timeout");
+                OriginStage::Timeout
+            }
+            ConsentOutcome::Busy => {
+                self.log("event=consent_origin_unreachable reason=consent_busy");
+                OriginStage::Unreachable("consent_busy")
+            }
+            ConsentOutcome::Unreachable(reason) => {
+                self.log(&format!(
+                    "event=consent_origin_unreachable reason={reason}"
+                ));
+                OriginStage::Unreachable(reason)
+            }
+        };
+    }
+}
+
+fn consent_form<'a>(
+    s: &AuthState,
+    headers: &HeaderMap,
+    form: &'a HashMap<String, String>,
+) -> Result<(PendingRow, &'a str), Response> {
+    let tx = form.get("tx").map(String::as_str).unwrap_or("");
+    let (p, binding) = s.pending_for_browser(tx, headers)?;
+    let csrf = form.get("csrf").map(String::as_str).unwrap_or("");
+    if !ct_eq(csrf, &s.consent_csrf(&p.id, &binding)) {
+        return Err(s.page_error(
+            StatusCode::BAD_REQUEST,
+            "Request rejected",
+            "The consent form was invalid.",
         ));
-        let mut res = redirect_with(
-            &p.redirect_uri,
-            &[("code", &code), ("state", &p.state), ("iss", &iss)],
-        );
-        res.extensions_mut().insert(LoggedGrant(grant_id));
-        res
-    } else {
-        s.log("event=consent_denied");
-        redirect_with(
-            &p.redirect_uri,
-            &[
-                ("error", "access_denied"),
-                ("state", &p.state),
-                ("iss", &iss),
-            ],
+    }
+    Ok((p, tx))
+}
+
+fn origin_backend<'a>(
+    s: &'a AuthState,
+    p: &PendingRow,
+) -> Result<&'a config::BackendPolicy, Response> {
+    s.config()
+        .backend(&p.backend)
+        .filter(|b| b.consent == ConsentMode::Origin)
+        .ok_or_else(|| {
+            s.page_error(
+                StatusCode::BAD_REQUEST,
+                "Request rejected",
+                "This request is not waiting for an app.",
+            )
+        })
+}
+
+async fn consent_start(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
+    blocking(move || consent_start_inner(&s, &headers, &body)).await
+}
+
+/// `POST /consent/start`: after a fresh passkey proof, send the request to the
+/// origin with a new pairing code (PHASE4.md §3.2 `proved` → `sent`, and the
+/// retries from `origin_unreachable`).
+fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> HandlerResult {
+    s.same_origin(headers)?;
+    let bad = || {
+        s.page_error(
+            StatusCode::BAD_REQUEST,
+            "Request rejected",
+            "The consent form was invalid.",
         )
     };
-    res.headers_mut()
-        .append(SET_COOKIE, cookie_header(TX_COOKIE, "", 0));
-    Ok(res)
+    let form = parse_unique_params(body).ok_or_else(bad)?;
+    let (p, tx) = consent_form(s, headers, &form)?;
+    let backend = origin_backend(s, &p)?;
+    let now = s.now();
+    if !proof_is_fresh(&p, now) {
+        return Err(s.page_error(
+            StatusCode::FORBIDDEN,
+            "Passkey required",
+            "Confirm with your passkey before sending this request.",
+        ));
+    }
+    let back = redirect_303(&format!("/consent?tx={tx}"));
+    let client = s.db("clients", s.0.store.client(&p.client_id))?;
+    let max_attempts = s.config().limits.origin_consent_attempts;
+    let timeout_secs = s.config().limits.origin_consent_secs;
+    let mut txs = s.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
+    let attempts = match txs.get(&p.id) {
+        None => 0,
+        Some(t) if matches!(t.stage, OriginStage::Unreachable(_)) && t.attempts < max_attempts => {
+            t.attempts
+        }
+        // Already sent, decided, or out of attempts: just show the state.
+        Some(_) => return Ok(back),
+    } + 1;
+    let ask = ConsentAsk {
+        backend: backend.id.clone(),
+        tx: p.id.clone(),
+        grant_id: random_id("g_"),
+        nonce: URL_SAFE_NO_PAD.encode(random_bytes::<32>()),
+        pairing_code: pairing_code(),
+        client_id: p.client_id.clone(),
+        client_name: client
+            .as_ref()
+            .and_then(|c| c.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "(no name given)".into()),
+        client_registered_at: client
+            .as_ref()
+            .map_or(0, |c| u64::try_from(c.created).unwrap_or(0)),
+        redirect_host: Url::parse(&p.redirect_uri)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_default(),
+        requested_at: u64::try_from(now).unwrap_or(0),
+        scopes: p.scope.split(' ').map(str::to_owned).collect(),
+        max_lifetime_secs: u64::try_from(backend.grant_lifetime_secs).unwrap_or(0),
+        expires_at: u64::try_from(now).unwrap_or(0) + timeout_secs,
+    };
+    let entry = OriginTx {
+        stage: OriginStage::Sent,
+        attempts,
+        pairing_code: ask.pairing_code.clone(),
+        grant_id: ask.grant_id.clone(),
+        started: now,
+        task: None,
+    };
+    let Some(port) = s.origin_port() else {
+        txs.insert(
+            p.id.clone(),
+            OriginTx {
+                stage: OriginStage::Unreachable("origin_unavailable"),
+                ..entry
+            },
+        );
+        s.log("event=consent_origin_unreachable reason=origin_unavailable");
+        return Ok(back);
+    };
+    txs.insert(p.id.clone(), entry);
+    drop(txs);
+    s.log(&format!(
+        "event=consent_sent backend={} attempt={attempts}",
+        backend.id
+    ));
+    let state = s.clone();
+    let tx_id = p.id.clone();
+    let limit = std::time::Duration::from_secs(timeout_secs);
+    let task = tokio::spawn(async move {
+        let started = tokio::time::Instant::now();
+        // The port's own deadline is `expires_at`; this bound is a backstop.
+        let outcome = tokio::time::timeout(
+            limit + std::time::Duration::from_secs(10),
+            port.consent(ask),
+        )
+        .await
+        .unwrap_or(ConsentOutcome::Timeout);
+        // A stream the origin closed at `expires_at` is "no decision".
+        let outcome = match outcome {
+            ConsentOutcome::Unreachable(_) if started.elapsed() >= limit => {
+                ConsentOutcome::Timeout
+            }
+            other => other,
+        };
+        state.finish_origin_attempt(&tx_id, attempts, outcome);
+    });
+    let mut txs = s.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
+    match txs.get_mut(&p.id) {
+        Some(t) if t.attempts == attempts && matches!(t.stage, OriginStage::Sent) => {
+            t.task = Some(task.abort_handle());
+        }
+        _ => {}
+    }
+    Ok(back)
+}
+
+async fn consent_status(
+    State(s): State<AuthState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    blocking(move || {
+        let params = parse_unique_params(query.as_deref().unwrap_or("").as_bytes())
+            .unwrap_or_default();
+        let tx = params.get("tx").map(String::as_str).unwrap_or("");
+        let (p, _) = s
+            .pending_for_browser(tx, &headers)
+            .map_err(|_| oauth_error(StatusCode::NOT_FOUND, "expired"))?;
+        let max_attempts = s.config().limits.origin_consent_attempts;
+        let txs = s.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
+        let (state, left) = match txs.get(&p.id) {
+            Some(t) => (t.stage.name(), max_attempts.saturating_sub(t.attempts)),
+            None if proof_is_fresh(&p, s.now()) => ("proved", max_attempts),
+            None => ("created", max_attempts),
+        };
+        Ok(json_response(
+            StatusCode::OK,
+            json!({ "state": state, "attempts_left": left }),
+        ))
+    })
+    .await
+}
+
+async fn consent_finish(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
+    blocking(move || consent_finish_inner(&s, &headers, &body)).await
+}
+
+/// `POST /consent/finish`: the final redirect (the code never appears in a
+/// JSON response). Approved → grant with the approved `resource_scope` and
+/// lifetime + one-use code; denied, timed out or unreachable → `access_denied`.
+fn consent_finish_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> HandlerResult {
+    s.same_origin(headers)?;
+    let bad = || {
+        s.page_error(
+            StatusCode::BAD_REQUEST,
+            "Request rejected",
+            "The consent form was invalid.",
+        )
+    };
+    let form = parse_unique_params(body).ok_or_else(bad)?;
+    let (p, tx) = consent_form(s, headers, &form)?;
+    let backend = origin_backend(s, &p)?;
+    let now = s.now();
+    let stage = s
+        .0
+        .origin_txs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&p.id)
+        .map(|t| (t.stage.clone(), t.grant_id.clone()));
+    match stage {
+        Some((
+            OriginStage::Approved {
+                resource_scope,
+                lifetime_secs,
+                approval,
+                at,
+            },
+            grant_id,
+        )) => {
+            let lifetime = i64::try_from(lifetime_secs)
+                .unwrap_or(i64::MAX)
+                .min(backend.grant_lifetime_secs);
+            let scope = serde_json::to_string(&resource_scope).map_err(|_| bad())?;
+            let res = issue_code(
+                s,
+                &p,
+                &backend.id,
+                &grant_id,
+                &scope,
+                Some(&approval),
+                at + lifetime,
+                now,
+                bad(),
+            )?;
+            s.0.origin_txs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&p.id);
+            Ok(res)
+        }
+        Some((
+            OriginStage::Denied | OriginStage::Timeout | OriginStage::Unreachable(_),
+            _,
+        )) => {
+            s.cancel_origin_attempt(&p.id);
+            deny_redirect(s, &p, now, bad())
+        }
+        Some((OriginStage::Sent, _)) | None => Ok(redirect_303(&format!("/consent?tx={tx}"))),
+    }
+}
+
+async fn consent_cancel(State(s): State<AuthState>, headers: HeaderMap, body: Bytes) -> Response {
+    blocking(move || {
+        s.same_origin(&headers)?;
+        let bad = || {
+            s.page_error(
+                StatusCode::BAD_REQUEST,
+                "Request rejected",
+                "The consent form was invalid.",
+            )
+        };
+        let form = parse_unique_params(&body).ok_or_else(bad)?;
+        let (p, _) = consent_form(&s, &headers, &form)?;
+        origin_backend(&s, &p)?;
+        s.cancel_origin_attempt(&p.id);
+        deny_redirect(&s, &p, s.now(), bad())
+    })
+    .await
 }
 
 // ------------------------------------------------------------- owner proof
@@ -1397,9 +2018,10 @@ fn owner_home_inner(s: &AuthState, headers: &HeaderMap) -> HandlerResult {
                 .unwrap_or_else(|| "never".into()),
         })
         .collect::<Vec<_>>();
+    let panels = s.origin_port().map(|p| p.panels()).unwrap_or_default();
     Ok(s.html(
         StatusCode::OK,
-        pages::owner_home(&grants, &s.owner_csrf(&session)),
+        pages::owner_home(&grants, &panels, &s.owner_csrf(&session)),
     ))
 }
 
@@ -1438,8 +2060,9 @@ async fn owner_revoke(State(s): State<AuthState>, headers: HeaderMap, body: Byte
         (|| {
             let (form, _) = owner_form(&s, &headers, &body)?;
             let grant_id = form.get("grant_id").map(String::as_str).unwrap_or("");
-            if s.db("grants", s.0.store.revoke_grant(grant_id))? {
+            if let Some(r) = s.db("grants", s.0.store.revoke_grant(grant_id))? {
                 s.log(&format!("event=grant_revoked by=owner grant={grant_id}"));
+                s.notify_revoked(&[r], RevokeReason::Owner);
             }
             let mut res = redirect_303("/owner");
             res.extensions_mut()
@@ -1454,11 +2077,12 @@ async fn owner_revoke_all(State(s): State<AuthState>, headers: HeaderMap, body: 
     blocking(move || {
         (|| {
             owner_form(&s, &headers, &body)?;
-            let ids = s.db("grants", s.0.store.revoke_all_grants())?;
+            let revoked = s.db("grants", s.0.store.revoke_all_grants())?;
             s.log(&format!(
                 "event=grants_revoked by=owner count={}",
-                ids.len()
+                revoked.len()
             ));
+            s.notify_revoked(&revoked, RevokeReason::Owner);
             Ok(redirect_303("/owner"))
         })()
     })
@@ -1541,7 +2165,9 @@ fn token_inner(
                 CodeTake::Missing => return Err(invalid_grant()),
                 CodeTake::Reused(grant_id) => {
                     // A replayed code may mean it leaked: revoke what it produced.
-                    s.db("grants", s.0.store.revoke_grant(&grant_id))?;
+                    if let Some(r) = s.db("grants", s.0.store.revoke_grant(&grant_id))? {
+                        s.notify_revoked(&[r], RevokeReason::Replay);
+                    }
                     s.log(&format!("event=code_reuse grant={grant_id} action=revoked"));
                     return Err(invalid_grant());
                 }
@@ -1562,7 +2188,9 @@ fn token_inner(
                 && pkce_s256_matches(verifier, &row.challenge);
             if !ok {
                 // The code is burnt; its pending grant can never activate.
-                s.db("grants", s.0.store.revoke_grant(&row.grant_id))?;
+                if let Some(r) = s.db("grants", s.0.store.revoke_grant(&row.grant_id))? {
+                    s.notify_revoked(&[r], RevokeReason::Client);
+                }
                 return Err(invalid_grant());
             }
             s.db(
@@ -1610,10 +2238,11 @@ fn token_inner(
                     }
                     grant
                 }
-                RefreshOutcome::FamilyRevoked(grant_id) => {
+                RefreshOutcome::FamilyRevoked(grant_id, revoked) => {
                     s.log(&format!(
                         "event=refresh_reuse grant={grant_id} action=family_revoked"
                     ));
+                    s.notify_revoked(revoked.as_slice(), RevokeReason::Replay);
                     return Err(invalid_grant());
                 }
                 RefreshOutcome::Missing | RefreshOutcome::Inactive => return Err(invalid_grant()),
@@ -1665,9 +2294,12 @@ async fn revoke(
                 s.db("revoke", s.0.store.grant_for_any_token(&hash_secret(token)))?
             {
                 // RFC 7009: a token of another client is silently ignored.
-                if owner == client_id && s.db("revoke", s.0.store.revoke_grant(&grant_id))? {
-                    s.log(&format!("event=grant_revoked by=client grant={grant_id}"));
-                    res.extensions_mut().insert(LoggedGrant(grant_id));
+                if owner == client_id {
+                    if let Some(r) = s.db("revoke", s.0.store.revoke_grant(&grant_id))? {
+                        s.log(&format!("event=grant_revoked by=client grant={grant_id}"));
+                        s.notify_revoked(&[r], RevokeReason::Client);
+                        res.extensions_mut().insert(LoggedGrant(grant_id));
+                    }
                 }
             }
             Ok(res)

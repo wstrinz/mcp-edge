@@ -14,3 +14,6 @@ th, td { text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid rgb
 form { display: inline; }
 #status { min-height: 1.5em; }
 .warning { border-left: 4px solid #c60; padding: 0.5rem 0.75rem; }
+.code { font-size: 2rem; letter-spacing: 0.2em; font-family: ui-monospace, monospace; }
+textarea { font: inherit; font-family: ui-monospace, monospace; width: 100%; box-sizing: border-box; }
+section { margin: 1rem 0; }
