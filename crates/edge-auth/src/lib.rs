@@ -35,6 +35,7 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use config::{
     AuthConfig, ConsentMode, ACCESS_TTL, CEREMONY_TTL, CODE_TTL, FRESH_PROOF, MIN_ENROLL_CODE_LEN,
     PENDING_TTL, SESSION_TTL,
@@ -52,7 +53,6 @@ use std::{
     },
 };
 use store::{CodeTake, PendingRow, RefreshOutcome, Revoked, Store};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use support::{
     ct_eq, hash_secret, hmac_b64, is_b64url, parse_unique_params, pkce_s256_matches, random_bytes,
     random_id, random_secret, valid_verifier, ClientIp, Clock, LogSink, RateLimiter,
@@ -450,12 +450,7 @@ impl AuthState {
         };
         for r in revoked {
             if self.is_origin_backend(&r.backend) {
-                port.revoked(
-                    &r.backend,
-                    &r.id,
-                    u64::try_from(r.gen).unwrap_or(0),
-                    reason,
-                );
+                port.revoked(&r.backend, &r.id, u64::try_from(r.gen).unwrap_or(0), reason);
             }
         }
     }
@@ -1426,9 +1421,7 @@ impl AuthState {
                 OriginStage::Unreachable("consent_busy")
             }
             ConsentOutcome::Unreachable(reason) => {
-                self.log(&format!(
-                    "event=consent_origin_unreachable reason={reason}"
-                ));
+                self.log(&format!("event=consent_origin_unreachable reason={reason}"));
                 OriginStage::Unreachable(reason)
             }
         };
@@ -1572,9 +1565,7 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
         .unwrap_or(ConsentOutcome::Timeout);
         // A stream the origin closed at `expires_at` is "no decision".
         let outcome = match outcome {
-            ConsentOutcome::Unreachable(_) if started.elapsed() >= limit => {
-                ConsentOutcome::Timeout
-            }
+            ConsentOutcome::Unreachable(_) if started.elapsed() >= limit => ConsentOutcome::Timeout,
             other => other,
         };
         state.finish_origin_attempt(&tx_id, attempts, outcome);
@@ -1595,8 +1586,8 @@ async fn consent_status(
     RawQuery(query): RawQuery,
 ) -> Response {
     blocking(move || {
-        let params = parse_unique_params(query.as_deref().unwrap_or("").as_bytes())
-            .unwrap_or_default();
+        let params =
+            parse_unique_params(query.as_deref().unwrap_or("").as_bytes()).unwrap_or_default();
         let tx = params.get("tx").map(String::as_str).unwrap_or("");
         let (p, _) = s
             .pending_for_browser(tx, &headers)
@@ -1636,13 +1627,12 @@ fn consent_finish_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Hand
     let (p, tx) = consent_form(s, headers, &form)?;
     let backend = origin_backend(s, &p)?;
     let now = s.now();
-    let stage = s
-        .0
-        .origin_txs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&p.id)
-        .map(|t| (t.stage.clone(), t.grant_id.clone()));
+    let stage =
+        s.0.origin_txs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p.id)
+            .map(|t| (t.stage.clone(), t.grant_id.clone()));
     match stage {
         Some((
             OriginStage::Approved {
@@ -1674,10 +1664,7 @@ fn consent_finish_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Hand
                 .remove(&p.id);
             Ok(res)
         }
-        Some((
-            OriginStage::Denied | OriginStage::Timeout | OriginStage::Unreachable(_),
-            _,
-        )) => {
+        Some((OriginStage::Denied | OriginStage::Timeout | OriginStage::Unreachable(_), _)) => {
             s.cancel_origin_attempt(&p.id);
             deny_redirect(s, &p, now, bad())
         }

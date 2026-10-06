@@ -1,4 +1,6 @@
-//! Crash-safe creation of the assertion signing seed.
+//! Crash-safe creation of the edge's secret seeds: the assertion signing
+//! key (`assertion-key.bin`) and, with iroh backends, the iroh identity
+//! (`iroh-edge.key`).
 //!
 //! The seed is written to a fresh temporary file in the same directory,
 //! flushed, then hard-linked into place, which fails rather than replacing an
@@ -34,7 +36,7 @@ fn getrandom_fill(buf: &mut [u8]) -> io::Result<()> {
 fn read_existing(path: &Path) -> io::Result<[u8; 32]> {
     fs::read(path)?
         .try_into()
-        .map_err(|_| io::Error::other("assertion key file has the wrong size"))
+        .map_err(|_| io::Error::other("key file has the wrong size"))
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {

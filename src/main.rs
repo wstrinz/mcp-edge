@@ -5,7 +5,8 @@ use edge_auth::{
 };
 use mcp_edge::{
     app::{self, AppConfig, AppDeps, EdgeLimits},
-    config::{EdgeConfig, DEFAULT_BIND},
+    config::{EdgeConfig, RouteKind, DEFAULT_BIND},
+    tunnel::{self, IrohDeps},
     Mode,
 };
 use std::{
@@ -104,6 +105,37 @@ async fn run_edge() {
         Err(_) => fail("WebAuthn relying-party configuration rejected"),
     };
     let backend_ids: Vec<String> = cfg.routes.iter().map(|r| r.id.clone()).collect();
+    // The iroh identity exists only when an iroh backend is configured. Its
+    // file is created like the assertion key and never silently replaced (a
+    // new id means re-enrolling every origin). A failed bind is not fatal:
+    // health stays green and iroh routes answer `origin_offline`.
+    let iroh = if cfg.routes.iter().any(|r| r.kind == RouteKind::Iroh) {
+        let seed =
+            match mcp_edge::keyfile::load_or_create_seed(&cfg.data_dir, tunnel::IROH_KEY_FILE) {
+                Ok(seed) => seed,
+                Err(e) => fail(&format!("iroh key unavailable: {e}")),
+            };
+        let secret_key = edge_tunnel::iroh::SecretKey::from_bytes(&seed);
+        let endpoint = match tunnel::bind_edge_endpoint(secret_key.clone()).await {
+            Ok(endpoint) => Some(endpoint),
+            Err(why) => {
+                eprintln!("mcp-edge: event=iroh_unavailable reason={why}");
+                None
+            }
+        };
+        eprintln!(
+            "mcp-edge: iroh edge_id={}",
+            edge_tunnel::ids::endpoint_id_hex(&secret_key.public())
+        );
+        Some(IrohDeps {
+            secret_key,
+            endpoint,
+            client: edge_tunnel::client::ClientConfig::default(),
+            addresses: Default::default(),
+        })
+    } else {
+        None
+    };
     let built = app::build(
         AppConfig {
             issuer: cfg.public_url.clone(),
@@ -120,6 +152,7 @@ async fn run_edge() {
             clock: Arc::new(SystemClock),
             log: Arc::new(StderrLog),
             signing_seed: seed,
+            iroh,
         },
     );
     let built = match built {

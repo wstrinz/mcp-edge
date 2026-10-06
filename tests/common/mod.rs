@@ -11,7 +11,7 @@ use edge_auth::{
 };
 use mcp_edge::{
     app::{self, AppConfig, AppDeps, EdgeLimits},
-    config::{parse_cidrs, parse_routes},
+    config::{parse_cidrs, parse_routes, resolve_origins},
     server::serve,
 };
 use serde_json::{json, Value};
@@ -58,6 +58,10 @@ pub struct Options {
     pub enroll_code: Option<String>,
     /// Route table (TOML); defaults to [`ROUTES`].
     pub routes: String,
+    /// Environment for `origin_endpoint_env` lookups (iroh routes).
+    pub env: HashMap<String, String>,
+    /// The edge's iroh identity/endpoint (iroh routes).
+    pub iroh: Option<mcp_edge::tunnel::IrohDeps>,
 }
 
 impl Default for Options {
@@ -74,6 +78,8 @@ impl Default for Options {
             edge_limits: EdgeLimits::default(),
             enroll_code: Some(ENROLL_CODE.into()),
             routes: ROUTES.to_string(),
+            env: HashMap::new(),
+            iroh: None,
         }
     }
 }
@@ -202,10 +208,12 @@ impl Harness {
         ));
         let log = Arc::new(MemoryLog::default());
         let proof = WebauthnOwnerProof::new("edge.test", &origin, "edge test").unwrap();
+        let mut routes = parse_routes(&opts.routes).unwrap();
+        resolve_origins(&mut routes, |k| opts.env.get(k).cloned()).unwrap();
         let built = app::build(
             AppConfig {
                 issuer: ISSUER.into(),
-                routes: parse_routes(&opts.routes).unwrap(),
+                routes,
                 redirect_allowlist: vec![CALLBACK.into(), OTHER_CALLBACK.into()],
                 enroll_code: opts.enroll_code,
                 trusted_proxies: parse_cidrs("127.0.0.0/8").unwrap(),
@@ -218,6 +226,7 @@ impl Harness {
                 clock: clock.clone(),
                 log: log.clone(),
                 signing_seed: SEED,
+                iroh: opts.iroh,
             },
         )
         .unwrap();

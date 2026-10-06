@@ -814,11 +814,7 @@ impl Store {
     /// stored), every live grant of the backend is revoked (gen++) and the new
     /// id stored, in one transaction. Returns whether a different id was
     /// stored before, and the revoked grants.
-    pub fn bind_origin(
-        &self,
-        backend: &str,
-        origin_id: &str,
-    ) -> StoreResult<(bool, Vec<Revoked>)> {
+    pub fn bind_origin(&self, backend: &str, origin_id: &str) -> StoreResult<(bool, Vec<Revoked>)> {
         let key = format!("origin:{backend}");
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -889,10 +885,7 @@ impl Store {
     }
 }
 
-fn revoke_grant_tx(
-    tx: &rusqlite::Transaction<'_>,
-    grant_id: &str,
-) -> StoreResult<Option<Revoked>> {
+fn revoke_grant_tx(tx: &rusqlite::Transaction<'_>, grant_id: &str) -> StoreResult<Option<Revoked>> {
     let live: Option<(String, i64)> = tx
         .query_row(
             "SELECT backend, gen FROM grants WHERE id = ?1 AND status IN ('active', 'pending')",
