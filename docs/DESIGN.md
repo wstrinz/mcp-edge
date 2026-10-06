@@ -174,8 +174,8 @@ below was taken.
 - Enrollment: the code must be ≥ 16 ASCII characters (otherwise ignored, enrollment
   disabled); it is compared in constant time, and stored only as a hash when consumed,
   in the same transaction as the first passkey. Once any passkey exists codes are never
-  accepted again. 10 wrong codes lock enrollment until restart (global, fail-closed;
-  an attacker can delay enrollment but not guess). Adding passkeys needs an owner session
+  accepted again. 10 wrong codes lock enrollment for the rest of a 15-minute window
+  (global; bounds guessing, and a stranger can delay enrollment only briefly). Adding passkeys needs an owner session
   authenticated within 5 minutes. There is no passkey removal yet; recovery from lost
   passkeys is "wipe the volume, enroll again", which also revokes everything.
 - The owner id (`sub`) is a random UUID created on first start.
@@ -227,8 +227,12 @@ below was taken.
   header intermittently — fixed there too); bodies 16 KiB (OAuth forms), 64 KiB
   (WebAuthn), per-backend MCP cap (default 1 MiB, echo 64 KiB). Per client IP per
   minute: 600 requests, 30 authorize, 60 token/revoke, 20 owner ceremonies; 10
-  registrations per hour per IP and 60 globally; 300 MCP requests per grant per minute;
-  64 live pending requests. A response cap is not needed for the in-binary echo and
+  registrations per hour per IP and 60 globally; 300 MCP requests per grant per minute.
+  Anonymous state never refuses the owner: WebAuthn ceremonies are capped at 4 per
+  client network and 64 overall, and pending authorization requests at 4 per network
+  and 64 overall, evicting the network's own oldest entry and then the oldest
+  unverified one instead of answering 429 (found in review: a refusing cap let one
+  anonymous IP lock the owner out of login and consent). A response cap is not needed for the in-binary echo and
   belongs to the HTTP forwarder in phase 3.
 - Client IP is the TCP peer unless `EDGE_TRUST_FORWARDED_FOR=1`, then the right-most
   `X-Forwarded-For` entry (the address Traefik saw). IPv6 is limited per /64. The

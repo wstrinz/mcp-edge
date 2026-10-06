@@ -268,6 +268,49 @@ async fn enrollment_is_disabled_without_a_code_and_locks_after_failures() {
         )
         .await;
     assert_eq!(res.status(), 429);
+    // The lock lifts by itself after the 15-minute window.
+    h.clock.advance(15 * 60);
+    let res = h
+        .post_json(
+            &mut b,
+            "/owner/register/start",
+            &json!({ "enroll_code": ENROLL_CODE }),
+        )
+        .await;
+    assert_eq!(res.status(), 200);
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn anonymous_floods_cannot_fill_ceremony_or_pending_tables() {
+    let mut h = Harness::start().await;
+    h.enroll().await;
+    let client = h.register_client(CALLBACK).await;
+    let (_, challenge) = pkce();
+    // Far more anonymous ceremonies and pending requests than the tables hold.
+    for i in 0..100 {
+        let mut anon = Browser::default();
+        let res = h
+            .post_json(&mut anon, "/owner/login/start", &json!({}))
+            .await;
+        assert_eq!(res.status(), 200);
+        let res = h
+            .get(
+                &mut anon,
+                &Harness::authorize_query(&client, CALLBACK, "echo", &challenge, &format!("f{i}")),
+            )
+            .await;
+        assert_eq!(res.status(), 303);
+    }
+    // The owner can still authorize end to end.
+    let (verifier, challenge) = pkce();
+    let (code, _) = h
+        .authorize_code(&client, CALLBACK, "echo", &challenge)
+        .await;
+    let (status, _) = h
+        .exchange(&client, &code, &verifier, CALLBACK, "echo")
+        .await;
+    assert_eq!(status, 200);
     h.finish().await;
 }
 

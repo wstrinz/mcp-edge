@@ -45,7 +45,7 @@ use std::{
     collections::HashMap,
     path::Path as FsPath,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
@@ -59,7 +59,12 @@ use url::Url;
 const TX_COOKIE: &str = "__Host-edge_tx";
 const CEREMONY_COOKIE: &str = "__Host-edge_cer";
 const SESSION_COOKIE: &str = "__Host-edge_sid";
-const MAX_CEREMONIES: usize = 32;
+const MAX_CEREMONIES: usize = 64;
+const MAX_CEREMONIES_PER_NET: usize = 4;
+/// Live pending authorization requests one client network may hold.
+const MAX_PENDING_PER_NET: i64 = 4;
+/// Enrollment-code failures are counted in windows of this length.
+const ENROLL_LOCK_WINDOW: i64 = 15 * 60;
 const MAX_REDIRECT_URIS: usize = 4;
 const MAX_STATE_LEN: usize = 512;
 const MAX_TOKEN_LEN: usize = 256;
@@ -113,6 +118,8 @@ struct Ceremony {
     kind: CeremonyKind,
     state: CeremonyState,
     expires: i64,
+    net: Option<std::net::IpAddr>,
+    seq: u64,
 }
 
 struct Inner {
@@ -124,8 +131,10 @@ struct Inner {
     log: Arc<dyn LogSink>,
     limiter: RateLimiter,
     ceremonies: Mutex<HashMap<String, Ceremony>>,
+    ceremony_seq: AtomicU64,
     csrf_key: [u8; 32],
-    enroll_failures: AtomicU32,
+    /// (window start, failures in that window)
+    enroll_failures: Mutex<(i64, u32)>,
     owner_id: String,
     issuer_origin: String,
     issuer_host: String,
@@ -316,7 +325,8 @@ impl AuthState {
             limiter: RateLimiter::new(10_000),
             ceremonies: Mutex::new(HashMap::new()),
             csrf_key: random_bytes::<32>(),
-            enroll_failures: AtomicU32::new(0),
+            ceremony_seq: AtomicU64::new(0),
+            enroll_failures: Mutex::new((0, 0)),
             owner_id,
             csp,
         })))
@@ -454,12 +464,35 @@ impl AuthState {
         }
     }
 
-    fn put_ceremony(&self, kind: CeremonyKind, state: CeremonyState) -> Result<String, Response> {
+    /// Store a ceremony. Never refuses: a client network keeps at most
+    /// `MAX_CEREMONIES_PER_NET` (its oldest is evicted), and when the table is
+    /// full the oldest overall is evicted, so anonymous callers cannot lock the
+    /// owner out by filling it.
+    fn put_ceremony(
+        &self,
+        kind: CeremonyKind,
+        state: CeremonyState,
+        ip: Option<std::net::IpAddr>,
+    ) -> String {
         let now = self.now();
+        let net = ip.map(support::network_key);
         let mut map = self.0.ceremonies.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, c| c.expires > now);
+        let oldest = |map: &HashMap<String, Ceremony>, same_net: bool| {
+            map.iter()
+                .filter(|(_, c)| !same_net || c.net == net)
+                .min_by_key(|(_, c)| c.seq)
+                .map(|(k, _)| k.clone())
+        };
+        if map.values().filter(|c| c.net == net).count() >= MAX_CEREMONIES_PER_NET {
+            if let Some(k) = oldest(&map, true) {
+                map.remove(&k);
+            }
+        }
         if map.len() >= MAX_CEREMONIES {
-            return Err(too_many());
+            if let Some(k) = oldest(&map, false) {
+                map.remove(&k);
+            }
         }
         let secret = random_secret("");
         map.insert(
@@ -468,9 +501,11 @@ impl AuthState {
                 kind,
                 state,
                 expires: now + CEREMONY_TTL,
+                net,
+                seq: self.0.ceremony_seq.fetch_add(1, Ordering::SeqCst),
             },
         );
-        Ok(secret)
+        secret
     }
 
     fn take_ceremony(&self, headers: &HeaderMap) -> Option<Ceremony> {
@@ -834,8 +869,18 @@ fn authorize_inner(s: &AuthState, ip: Option<std::net::IpAddr>, query: &str) -> 
     };
 
     let now = s.now();
+    // Bounded without letting anonymous callers lock the owner out: one client
+    // network keeps at most a few live requests (its oldest is dropped), and a
+    // full table drops the oldest request nobody has proved a passkey for.
     let max_pending = i64::try_from(s.config().limits.max_pending).unwrap_or(i64::MAX);
-    if s.db("pending", s.0.store.live_pending_count(now))? >= max_pending {
+    let net = ip
+        .map(|ip| support::network_key(ip).to_string())
+        .unwrap_or_default();
+    if !s.db(
+        "pending",
+        s.0.store
+            .make_room_for_pending(&net, MAX_PENDING_PER_NET, max_pending, now),
+    )? {
         return Err(too_many());
     }
     let binding = random_secret("");
@@ -852,7 +897,7 @@ fn authorize_inner(s: &AuthState, ip: Option<std::net::IpAddr>, query: &str) -> 
         verified_at: None,
         used: false,
     };
-    s.db("pending", s.0.store.insert_pending(&pending, now))?;
+    s.db("pending", s.0.store.insert_pending(&pending, &net, now))?;
     let mut res = redirect_303(&format!("/consent?tx={}", pending.id));
     res.headers_mut()
         .append(SET_COOKIE, cookie_header(TX_COOKIE, &binding, PENDING_TTL));
@@ -1059,7 +1104,7 @@ fn login_start_inner(
         s.0.proof
             .start_login(&creds)
             .map_err(|_| oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
-    let secret = s.put_ceremony(CeremonyKind::Login { tx: req.tx }, state)?;
+    let secret = s.put_ceremony(CeremonyKind::Login { tx: req.tx }, state, ip);
     Ok(ceremony_response(options, &secret))
 }
 
@@ -1155,8 +1200,18 @@ fn register_start_inner(
         let Some(configured) = s.0.enroll_code.as_deref() else {
             return Err(oauth_error(StatusCode::FORBIDDEN, "enrollment_disabled"));
         };
+        // At most `max_enroll_failures` wrong codes per 15-minute window; the
+        // lock lifts by itself (no restart), which bounds guessing without
+        // letting a stranger block enrollment for long.
         let max = s.config().limits.max_enroll_failures;
-        if s.0.enroll_failures.load(Ordering::SeqCst) >= max {
+        let mut failures =
+            s.0.enroll_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+        if now - failures.0 >= ENROLL_LOCK_WINDOW {
+            *failures = (now, 0);
+        }
+        if failures.1 >= max {
             return Err(oauth_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "enrollment_locked",
@@ -1164,7 +1219,8 @@ fn register_start_inner(
         }
         let provided = req.enroll_code.unwrap_or_default();
         if !ct_eq(&provided, configured) {
-            s.0.enroll_failures.fetch_add(1, Ordering::SeqCst);
+            failures.1 += 1;
+            drop(failures);
             s.log("event=enroll_code_rejected");
             return Err(oauth_error(
                 StatusCode::FORBIDDEN,
@@ -1195,7 +1251,7 @@ fn register_start_inner(
         s.0.proof
             .start_registration(&s.0.owner_id, &existing)
             .map_err(|_| oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
-    let secret = s.put_ceremony(kind, state)?;
+    let secret = s.put_ceremony(kind, state, ip);
     Ok(ceremony_response(options, &secret))
 }
 

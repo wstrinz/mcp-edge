@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS pending (
     id TEXT PRIMARY KEY, binding_hash TEXT NOT NULL, client_id TEXT NOT NULL,
     redirect_uri TEXT NOT NULL, state TEXT NOT NULL, code_challenge TEXT NOT NULL,
     backend TEXT NOT NULL, scope TEXT NOT NULL, created INTEGER NOT NULL,
-    expires INTEGER NOT NULL, verified_at INTEGER, used INTEGER NOT NULL DEFAULT 0);
+    expires INTEGER NOT NULL, verified_at INTEGER, used INTEGER NOT NULL DEFAULT 0,
+    net TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS grants (
     id TEXT PRIMARY KEY, client_id TEXT NOT NULL, backend TEXT NOT NULL, scope TEXT NOT NULL,
     resource_scope TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL,
@@ -326,18 +327,45 @@ impl Store {
 
     // ---- pending authorization requests ----
 
-    pub fn live_pending_count(&self, now: i64) -> StoreResult<i64> {
-        self.conn().query_row(
+    /// Make room for one more live pending request from client network `net`:
+    /// drop that network's oldest live requests beyond `per_net - 1`, then, if
+    /// the table holds `max` live requests, the oldest one not yet backed by a
+    /// passkey proof. Returns false only if every live request is verified.
+    pub fn make_room_for_pending(
+        &self,
+        net: &str,
+        per_net: i64,
+        max: i64,
+        now: i64,
+    ) -> StoreResult<bool> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM pending WHERE id IN (
+                SELECT id FROM pending WHERE net = ?1 AND expires > ?2 AND used = 0
+                ORDER BY created DESC, rowid DESC LIMIT -1 OFFSET ?3)",
+            params![net, now, (per_net - 1).max(0)],
+        )?;
+        let live: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending WHERE expires > ?1 AND used = 0",
             [now],
             |r| r.get(0),
-        )
+        )?;
+        if live < max {
+            return Ok(true);
+        }
+        let removed = conn.execute(
+            "DELETE FROM pending WHERE id IN (
+                SELECT id FROM pending WHERE expires > ?1 AND used = 0 AND verified_at IS NULL
+                ORDER BY created, rowid LIMIT ?2)",
+            params![now, live - max + 1],
+        )?;
+        Ok(i64::try_from(removed).unwrap_or(0) > live - max)
     }
 
-    pub fn insert_pending(&self, p: &PendingRow, now: i64) -> StoreResult<()> {
+    pub fn insert_pending(&self, p: &PendingRow, net: &str, now: i64) -> StoreResult<()> {
         self.conn().execute(
             "INSERT INTO pending (id, binding_hash, client_id, redirect_uri, state, code_challenge,
-                backend, scope, created, expires) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                backend, scope, created, expires, net) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 p.id,
                 p.binding_hash,
@@ -348,7 +376,8 @@ impl Store {
                 p.backend,
                 p.scope,
                 now,
-                p.expires
+                p.expires,
+                net
             ],
         )?;
         Ok(())
