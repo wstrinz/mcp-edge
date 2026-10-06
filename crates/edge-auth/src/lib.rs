@@ -471,7 +471,9 @@ impl AuthState {
             h.insert("content-security-policy", v);
         }
         h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-        h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+        // `same-origin`, not `no-referrer`: under `no-referrer` browsers send
+        // `Origin: null` on our own form POSTs, which `same_origin` refuses.
+        h.insert("referrer-policy", HeaderValue::from_static("same-origin"));
         no_store(res)
     }
 
@@ -480,6 +482,9 @@ impl AuthState {
     }
 
     /// Browser endpoints refuse cross-origin requests when the browser says so.
+    /// `Origin: null` is refused too (sandboxed frames send it), so every page
+    /// must use a referrer policy under which same-origin form POSTs keep their
+    /// real Origin; see `html`.
     fn same_origin(&self, headers: &HeaderMap) -> Result<(), Response> {
         match headers.get(ORIGIN) {
             None => Ok(()),

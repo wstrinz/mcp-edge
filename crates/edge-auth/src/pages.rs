@@ -33,7 +33,7 @@ pub(crate) fn layout(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<meta name=\"referrer\" content=\"no-referrer\">\
+<meta name=\"referrer\" content=\"same-origin\">\
 <title>{}</title><link rel=\"stylesheet\" href=\"/static/edge.css\">\
 <script src=\"/static/edge.js\" defer></script></head>\
 <body><main>{body}<p id=\"status\" role=\"status\"></p></main></body></html>\n",

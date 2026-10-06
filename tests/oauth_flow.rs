@@ -78,7 +78,12 @@ async fn run_full_flow(h: &mut Harness) -> Secrets {
         .to_str()
         .unwrap()
         .contains("frame-ancestors 'none'"));
+    // A form POST from a `no-referrer` page carries `Origin: null` in real
+    // browsers, which the same-origin check refuses (found in the first live
+    // claude.ai run). Pages must keep same-origin form posts' Origin intact.
+    assert_eq!(page.headers()["referrer-policy"], "same-origin");
     let html = page.text().await.unwrap();
+    assert!(html.contains("<meta name=\"referrer\" content=\"same-origin\">"));
     assert!(html.contains("Echo A"));
     assert!(
         html.contains("Synthetic &lt;Client&gt;"),
@@ -103,11 +108,13 @@ async fn run_full_flow(h: &mut Harness) -> Secrets {
         .expect("consent form");
     secrets.push(csrf.clone());
     secrets.extend(browser.values());
+    // Submit as a browser does under `Referrer-Policy: same-origin`.
     let res = h
-        .post_form(
+        .post_form_origin(
             &mut browser,
             "/consent",
             &[("tx", &tx), ("csrf", &csrf), ("decision", "approve")],
+            ISSUER,
         )
         .await;
     assert_eq!(res.status(), 303);
