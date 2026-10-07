@@ -13,6 +13,7 @@ pub mod echo;
 pub mod forward;
 pub mod keyfile;
 pub mod server;
+pub mod tunnel;
 
 use std::io;
 

@@ -5,6 +5,7 @@ use crate::{
     config::{forwarded_client, Cidr, Route, RouteKind},
     echo::{EchoBackend, SUPPORTED_PROTOCOL_VERSIONS},
     forward::{self, HttpBackend, Outgoing},
+    tunnel::{Gateway, IrohBackend, IrohDeps},
 };
 use axum::{
     body::{Body, Bytes},
@@ -20,10 +21,15 @@ use axum::{
 };
 use edge_assert::{GrantContext, RequestBinding, Signer};
 use edge_auth::{
-    config::{AuthConfig, BackendPolicy, ConsentMode, Limits},
+    config::{AuthConfig, BackendPolicy, Limits},
     owner::OwnerProof,
     support::{ClientIp, Clock, LogSink},
     AccessGrant, AuthState, BearerError, InitError, LoggedGrant,
+};
+use edge_tunnel::{
+    client::{McpPostRequest, Reply, TunnelError},
+    meta::{Accept, ContentType, McpProtocolVersion},
+    EdgeFailure,
 };
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -88,6 +94,9 @@ pub struct AppDeps {
     pub log: Arc<dyn LogSink>,
     /// Ed25519 seed for edge assertions.
     pub signing_seed: [u8; 32],
+    /// The edge's iroh identity and endpoint; required when the route table
+    /// has a `kind = "iroh"` backend.
+    pub iroh: Option<IrohDeps>,
 }
 
 pub struct App {
@@ -95,6 +104,8 @@ pub struct App {
     pub auth: AuthState,
     /// base64url Ed25519 public key that backends verify assertions with.
     pub assertion_public_key: String,
+    /// Present when the route table has iroh backends.
+    pub gateway: Option<Arc<Gateway>>,
 }
 
 /// Response extension naming the backend (for request logs).
@@ -104,6 +115,7 @@ struct LoggedBackend(String);
 enum Handler {
     Echo(EchoBackend),
     Http(HttpBackend),
+    Iroh(Arc<IrohBackend>),
 }
 
 struct Backend {
@@ -114,6 +126,8 @@ struct Backend {
 struct Edge {
     auth: AuthState,
     signer: Signer,
+    /// Owns the iroh routes (and keeps the consent port alive).
+    _gateway: Option<Arc<Gateway>>,
     backends: HashMap<String, Backend>,
     trusted_proxies: Vec<Cidr>,
     limits: EdgeLimits,
@@ -157,16 +171,33 @@ impl Drop for InflightSlot {
 pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
     let signer = Signer::from_seed(&deps.signing_seed, cfg.issuer.clone());
     let public_key = signer.public_key_base64url();
-    let mut backends = HashMap::new();
-    let mut policies = Vec::new();
-    for route in &cfg.routes {
-        policies.push(BackendPolicy {
+    let policies = cfg
+        .routes
+        .iter()
+        .map(|route| BackendPolicy {
             id: route.id.clone(),
             display_name: route.display_name.clone(),
             scopes: route.scopes.clone(),
             grant_lifetime_secs: route.grant_lifetime_secs,
-            consent: ConsentMode::Edge,
-        });
+            consent: route.consent,
+        })
+        .collect();
+    let auth = AuthState::new(
+        AuthConfig {
+            issuer: cfg.issuer.clone(),
+            redirect_allowlist: cfg.redirect_allowlist,
+            enroll_code: cfg.enroll_code,
+            backends: policies,
+            limits: cfg.auth_limits,
+        },
+        deps.db_path.as_deref(),
+        deps.proof,
+        deps.clock,
+        deps.log,
+    )?;
+    let gateway = Gateway::new(&cfg.issuer, &cfg.routes, deps.iroh, &auth, &public_key)?;
+    let mut backends = HashMap::new();
+    for route in &cfg.routes {
         let handler = match route.kind {
             RouteKind::Echo => Handler::Echo(
                 EchoBackend::new(&public_key, &cfg.issuer, &route.id)
@@ -182,6 +213,13 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
                         .map_err(|_| InitError::Config("http client"))?,
                 )
             }
+            RouteKind::Iroh => Handler::Iroh(
+                gateway
+                    .as_ref()
+                    .and_then(|g| g.backend(&route.id))
+                    .cloned()
+                    .ok_or(InitError::Config("iroh backend"))?,
+            ),
         };
         backends.insert(
             route.id.clone(),
@@ -191,35 +229,23 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
             },
         );
     }
-    let auth = AuthState::new(
-        AuthConfig {
-            issuer: cfg.issuer.clone(),
-            redirect_allowlist: cfg.redirect_allowlist,
-            enroll_code: cfg.enroll_code,
-            backends: policies,
-            limits: cfg.auth_limits,
-        },
-        deps.db_path.as_deref(),
-        deps.proof,
-        deps.clock,
-        deps.log,
-    )?;
     let edge = Arc::new(Edge {
         auth: auth.clone(),
         signer,
+        _gateway: gateway.clone(),
         backends,
         trusted_proxies: cfg.trusted_proxies,
         limits: cfg.edge_limits,
         inflight: Mutex::new(HashMap::new()),
     });
-    let gateway = Router::new()
+    let gateway_routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/.well-known/edge-assertion-key", get(assertion_key))
         .route("/{backend}/mcp", any(mcp))
         .with_state(edge.clone());
     let router = edge_auth::router(auth.clone())
-        .merge(gateway)
+        .merge(gateway_routes)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(edge.clone(), guard))
         .layer(middleware::from_fn_with_state(edge, request_log));
@@ -227,6 +253,7 @@ pub fn build(cfg: AppConfig, deps: AppDeps) -> Result<App, InitError> {
         router,
         auth,
         assertion_public_key: public_key,
+        gateway,
     })
 }
 
@@ -460,16 +487,17 @@ async fn mcp(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let started = tokio::time::Instant::now();
     let Some(backend) = edge.backends.get(&backend_id) else {
         return json_error(StatusCode::NOT_FOUND, "not_found");
     };
     let allowed = match &backend.handler {
-        Handler::Echo(_) => method == Method::POST,
+        Handler::Echo(_) | Handler::Iroh(_) => method == Method::POST,
         Handler::Http(_) => forward::ALLOWED_METHODS.contains(&method),
     };
     if !allowed {
         let mut res = method_not_allowed(match &backend.handler {
-            Handler::Echo(_) => "POST",
+            Handler::Echo(_) | Handler::Iroh(_) => "POST",
             Handler::Http(_) => forward::ALLOW_HEADER,
         });
         res.extensions_mut()
@@ -514,6 +542,15 @@ async fn mcp(
                     now,
                 };
                 http_request(&edge, backend, http, &grant, req).await
+            }
+            Handler::Iroh(iroh) => {
+                let call = IrohCall {
+                    headers: &headers,
+                    body,
+                    now,
+                    started,
+                };
+                iroh_request(&edge, backend, iroh, &grant, call).await
             }
         }
     };
@@ -653,4 +690,343 @@ async fn http_request(
             edge.auth.clone(),
         )
         .await)
+}
+
+/// The client request as the iroh forwarder needs it.
+struct IrohCall<'a> {
+    headers: &'a HeaderMap,
+    body: Body,
+    now: i64,
+    /// When the gateway handler started (the edge's 30 s deadline runs from
+    /// slightly earlier; the tunnel budget stays inside it).
+    started: tokio::time::Instant,
+}
+
+/// Total tunnel budget for one `mcp_post` (PHASE4.md §2.6).
+const IROH_TOTAL: Duration = Duration::from_secs(25);
+/// The tunnel budget ends this long after the handler started, inside the
+/// edge's 30 s request deadline.
+const IROH_HANDLER_DEADLINE: Duration = Duration::from_secs(28);
+
+/// The JSON-RPC `id` of a request body, echoed in edge-generated JSON-RPC
+/// errors (never logged).
+fn rpc_id(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .filter(|id| id.is_string() || id.is_number())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Plain-language text for the §2.8 503 contract.
+fn unavailable_message(reason: &str, app: &str) -> String {
+    match reason {
+        "origin_remote_off" => format!(
+            "{app} is reachable, but remote access is turned off in the app. Turn it on and \
+             try again."
+        ),
+        "origin_unenrolled" => format!(
+            "{app} needs to be enrolled with this edge again before it can be used remotely."
+        ),
+        "origin_rejected_edge" => format!(
+            "{app} does not recognize this edge. The owner must paste the edge's enrollment \
+             string into the app."
+        ),
+        "origin_locked" => format!("{app} is locked or not ready. Try again after unlocking it."),
+        "origin_paused" => {
+            format!("Remote access in {app} is paused until the owner resumes it in the app.")
+        }
+        "origin_busy" => format!("{app} is busy right now. Try again shortly."),
+        _ => format!(
+            "{app} is not reachable: the computer it runs on is off or asleep, or the app is \
+             closed. Try again when it is running."
+        ),
+    }
+}
+
+/// 503 for every `origin_*` reason (§2.8): JSON-RPC error body, `Retry-After`.
+fn origin_unavailable(reason: &'static str, app: &str, id: serde_json::Value) -> Response {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32010,
+            "message": unavailable_message(reason, app),
+            "data": { "reason": reason },
+        },
+    });
+    let mut res = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    let h = res.headers_mut();
+    h.insert("retry-after", HeaderValue::from_static("30"));
+    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+/// The edge's HTTP answer for a tunnel failure or origin refusal.
+fn tunnel_failure(
+    edge: &Edge,
+    backend: &Backend,
+    grant: &AccessGrant,
+    failure: EdgeFailure,
+    retry_after: Option<u16>,
+    id: serde_json::Value,
+) -> Response {
+    let log = |event: &str| {
+        edge.auth.log(&format!(
+            "event={event} backend={} grant={}",
+            backend.route.id, grant.grant_id
+        ));
+    };
+    if failure.is_origin_unavailable() {
+        log(failure.reason());
+        return origin_unavailable(failure.reason(), &backend.route.display_name, id);
+    }
+    match failure {
+        EdgeFailure::InvalidToken => challenge(edge, &backend.route.id, Some("invalid_token")),
+        EdgeFailure::TooManyRequests => {
+            let mut res = json_error(StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight");
+            let secs = retry_after.unwrap_or(1).clamp(1, 300).to_string();
+            if let Ok(v) = HeaderValue::from_str(&secs) {
+                res.headers_mut().insert("retry-after", v);
+            }
+            res
+        }
+        EdgeFailure::GatewayTimeout => {
+            log("origin_timeout");
+            json_error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout")
+        }
+        EdgeFailure::PayloadTooLarge => {
+            json_error(StatusCode::PAYLOAD_TOO_LARGE, "request_too_large")
+        }
+        EdgeFailure::BackendRejected => {
+            log("backend_rejected_assertion");
+            json_error(StatusCode::BAD_GATEWAY, "backend_rejected")
+        }
+        EdgeFailure::Internal => {
+            log("tunnel_internal");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        }
+        _ => {
+            log("backend_protocol");
+            json_error(StatusCode::BAD_GATEWAY, "backend_protocol")
+        }
+    }
+}
+
+/// A `kind = "iroh"` backend (PHASE4.md §2.4, §2.7, §2.8). The tunnel request
+/// is built from scratch: no header, URL, cookie or client `Edge-Assertion`
+/// crosses; only the exact body, the derived `accept`, the validated protocol
+/// version and an assertion minted here.
+async fn iroh_request(
+    edge: &Edge,
+    backend: &Backend,
+    iroh: &IrohBackend,
+    grant: &AccessGrant,
+    call: IrohCall<'_>,
+) -> Result<Response, Response> {
+    let IrohCall {
+        headers,
+        body,
+        now,
+        started,
+    } = call;
+    // Same header rules as http backends (each allowlisted header at most
+    // once, bounded, visible ASCII), although none is forwarded verbatim.
+    forward::select_request_headers(headers)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    if !is_json(headers) {
+        return Err(json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+        ));
+    }
+    let protocol = match headers.get("mcp-protocol-version") {
+        None => None,
+        Some(v) => Some(
+            v.to_str()
+                .ok()
+                .and_then(McpProtocolVersion::parse)
+                .ok_or_else(|| {
+                    json_error(StatusCode::BAD_REQUEST, "unsupported_protocol_version")
+                })?,
+        ),
+    };
+    let accept = match headers.get(axum::http::header::ACCEPT) {
+        Some(v)
+            if v.to_str().is_ok_and(|v| {
+                v.split(',').any(|part| {
+                    part.split(';')
+                        .next()
+                        .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/event-stream"))
+                })
+            }) =>
+        {
+            Accept::JsonOrSse
+        }
+        _ => Accept::Json,
+    };
+    let bytes = read_body(body, iroh.max_request_bytes).await?;
+    if bytes.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let id = rpc_id(&bytes);
+    let Some(client) = iroh.client.as_ref() else {
+        edge.auth.log(&format!(
+            "event=origin_offline backend={} grant={} reason=endpoint_unavailable",
+            backend.route.id, grant.grant_id
+        ));
+        return Ok(origin_unavailable(
+            "origin_offline",
+            &backend.route.display_name,
+            id,
+        ));
+    };
+    let binding = RequestBinding {
+        method: "POST",
+        path: "/mcp",
+        body: &bytes,
+    };
+    let assertion = edge
+        .signer
+        .mint(&grant_context(backend, grant), binding, now, ASSERTION_TTL)
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))?;
+    if assertion.len() > edge_tunnel::limits::ASSERTION {
+        edge.auth.log(&format!(
+            "event=assertion_too_large backend={} grant={}",
+            backend.route.id, grant.grant_id
+        ));
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+        ));
+    }
+    let budget = IROH_TOTAL.min(IROH_HANDLER_DEADLINE.saturating_sub(started.elapsed()));
+    if budget < Duration::from_secs(1) {
+        return Err(json_error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout"));
+    }
+    let reply = client
+        .mcp_post(McpPostRequest {
+            grant_id: grant.grant_id.clone(),
+            accept,
+            mcp_protocol_version: protocol,
+            assertion,
+            request_id: edge_tunnel::client::new_request_id(),
+            body: bytes,
+            budget,
+        })
+        .await;
+    let resp = match reply {
+        Ok(Reply::Ok(resp)) => resp,
+        Ok(Reply::Refused(r)) => {
+            if r.error.revokes_edge_grant() {
+                // The origin no longer honours this grant (§2.7): end it here
+                // too, so the client must reconnect through consent.
+                let auth = edge.auth.clone();
+                let grant_id = grant.grant_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    auth.revoke_for_origin(&grant_id, "origin_grant_revoked")
+                })
+                .await;
+            }
+            return Ok(tunnel_failure(
+                edge,
+                backend,
+                grant,
+                r.edge_failure(),
+                r.retry_after,
+                id,
+            ));
+        }
+        Err(e) => {
+            let retry = matches!(e, TunnelError::EdgeBusy).then_some(1);
+            return Ok(tunnel_failure(
+                edge,
+                backend,
+                grant,
+                e.edge_failure(),
+                retry,
+                id,
+            ));
+        }
+    };
+    let status = resp.status;
+    let log = |event: &str| {
+        edge.auth.log(&format!(
+            "event={event} backend={} grant={}",
+            backend.route.id, grant.grant_id
+        ));
+    };
+    if status == 401 {
+        // An MCP-level 401 would make the client discard a valid token; the
+        // origin's authorization refusals arrive as `error` codes instead.
+        log("backend_rejected_assertion");
+        return Ok(json_error(StatusCode::BAD_GATEWAY, "backend_rejected"));
+    }
+    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    match resp.content_type {
+        Some(ContentType::EventStream) => {
+            // Streamed as it arrives; an error ends the chunked body without
+            // its terminator, so the client sees truncation, never success.
+            let cap = iroh.max_response_bytes;
+            let auth = edge.auth.clone();
+            let tag = format!("backend={} grant={}", backend.route.id, grant.grant_id);
+            let mut received = 0usize;
+            let stream = futures_util::StreamExt::map(resp.body.into_stream(), move |item| {
+                let chunk = item.map_err(|e| {
+                    auth.log(&format!(
+                        "event=origin_stream_error {tag} reason={}",
+                        e.edge_failure().reason()
+                    ));
+                    std::io::Error::other("origin response aborted")
+                })?;
+                received = received.saturating_add(chunk.len());
+                if received > cap {
+                    auth.log(&format!("event=origin_response_too_large {tag}"));
+                    return Err(std::io::Error::other("origin response too large"));
+                }
+                Ok(chunk)
+            });
+            let mut res = Response::new(Body::from_stream(stream));
+            *res.status_mut() = status_code;
+            let h = res.headers_mut();
+            h.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            h.insert("x-accel-buffering", HeaderValue::from_static("no"));
+            Ok(res)
+        }
+        content_type => {
+            // JSON (≤ 1 MiB) is read completely first, so a truncated or
+            // oversized answer is a clean 502 rather than a broken body.
+            let data = match resp.body.collect().await {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(tunnel_failure(
+                        edge,
+                        backend,
+                        grant,
+                        e.edge_failure(),
+                        None,
+                        id,
+                    ))
+                }
+            };
+            if data.len() > iroh.max_response_bytes {
+                log("origin_response_too_large");
+                return Ok(json_error(StatusCode::BAD_GATEWAY, "backend_protocol"));
+            }
+            let mut res = match content_type {
+                None if data.is_empty() => status_code.into_response(),
+                None => {
+                    log("backend_protocol");
+                    return Ok(json_error(StatusCode::BAD_GATEWAY, "backend_protocol"));
+                }
+                Some(_) => {
+                    (status_code, [(CONTENT_TYPE, "application/json")], data).into_response()
+                }
+            };
+            res.headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            Ok(res)
+        }
+    }
 }

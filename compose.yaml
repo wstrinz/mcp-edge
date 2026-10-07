@@ -4,7 +4,9 @@
 # over Coolify's network on the exposed port; no host port is published.
 # EDGE_ENROLL_CODE is a Coolify secret, set only for the first owner passkey
 # enrollment and then removed. Nothing here is deployed by committing it to a
-# non-deployment branch.
+# non-deployment branch. With an iroh backend enabled the container needs
+# outbound UDP (QUIC to the n0 relays / hole punching) and HTTPS to n0 DNS; no
+# port is published for it, and the edge-data volume also holds iroh-edge.key.
 services:
   edge:
     build:
@@ -21,6 +23,9 @@ services:
       EDGE_DATA_DIR: /data
       EDGE_ROUTES: /etc/mcp-edge/routes.toml
       EDGE_ENROLL_CODE: ${EDGE_ENROLL_CODE:-}
+      # Phase 4: the Wiskit origin EndpointId (Coolify secret, 64 lowercase hex).
+      # Read only when config/routes.toml enables the wiskit iroh route.
+      EDGE_ORIGIN_WISKIT: ${EDGE_ORIGIN_WISKIT:-}
     expose:
       - "8080"
     volumes:

@@ -1,6 +1,8 @@
 //! Environment and route-table configuration for `EDGE_MODE=edge`.
 
+pub use edge_auth::config::ConsentMode;
 use edge_auth::config::{CLAUDE_CALLBACK, DEFAULT_GRANT_LIFETIME};
+use edge_tunnel::iroh::EndpointId;
 use serde::Deserialize;
 use std::{
     fmt,
@@ -37,6 +39,13 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 300;
 pub const DEFAULT_MAX_CONCURRENT_PER_GRANT: usize = 4;
 const MAX_CONCURRENT_PER_GRANT_LIMIT: usize = 64;
+/// `kind = "iroh"`: the tunnel's `mcp_post` caps (PHASE4.md §2.3) are the
+/// upper bounds; a route may only lower them.
+pub const IROH_MAX_REQUEST_BYTES: usize = edge_tunnel::limits::MCP_BODY;
+pub const IROH_MAX_RESPONSE_BYTES: usize = edge_tunnel::limits::MCP_RESPONSE;
+/// Required prefix of `origin_endpoint_env`, so a route can only name a
+/// variable meant for it (never, say, `EDGE_ENROLL_CODE`).
+pub const ORIGIN_ENV_PREFIX: &str = "EDGE_ORIGIN_";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(pub String);
@@ -52,12 +61,25 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
     Err(ConfigError(msg.into()))
 }
 
-/// What serves a route: the built-in echo backend or an HTTP upstream fixed
-/// in the route table. `iroh` is rejected until its phase lands.
+/// What serves a route: the built-in echo backend, an HTTP upstream fixed in
+/// the route table, or a local app reached over iroh (`mcp-edge/1`) whose
+/// EndpointId comes from an environment variable named in the route table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteKind {
     Echo,
     Http,
+    Iroh,
+}
+
+/// Settings of a `kind = "iroh"` backend (always `consent = "origin"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrohOrigin {
+    /// Name of the environment variable holding the origin EndpointId.
+    pub env: String,
+    /// The configured origin; `None` until [`resolve_origins`] ran.
+    pub origin_id: Option<EndpointId>,
+    /// Response body cap (≤ the tunnel's 1 MiB).
+    pub max_response_bytes: usize,
 }
 
 /// Settings of a `kind = "http"` backend. The upstream URL comes only from
@@ -84,8 +106,12 @@ pub struct Route {
     pub scopes: Vec<String>,
     pub grant_lifetime_secs: i64,
     pub max_request_bytes: usize,
+    /// Who approves resource scope: the edge page, or the origin app.
+    pub consent: ConsentMode,
     /// Present exactly when `kind == RouteKind::Http`.
     pub http: Option<HttpUpstream>,
+    /// Present exactly when `kind == RouteKind::Iroh`.
+    pub iroh: Option<IrohOrigin>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +149,9 @@ struct BackendEntry {
     idle_timeout_secs: Option<u64>,
     #[serde(default)]
     max_concurrent_per_grant: Option<usize>,
+    // kind = "iroh" only:
+    #[serde(default)]
+    origin_endpoint_env: Option<String>,
 }
 
 impl BackendEntry {
@@ -134,6 +163,96 @@ impl BackendEntry {
             || self.idle_timeout_secs.is_some()
             || self.max_concurrent_per_grant.is_some()
     }
+
+    /// Keys only an http backend may set (`max_response_bytes` is shared
+    /// with iroh).
+    fn has_http_only_keys(&self) -> bool {
+        self.url.is_some()
+            || self.connect_timeout_secs.is_some()
+            || self.response_timeout_secs.is_some()
+            || self.idle_timeout_secs.is_some()
+            || self.max_concurrent_per_grant.is_some()
+    }
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.len() > ORIGIN_ENV_PREFIX.len()
+        && name.len() <= 64
+        && name.starts_with(ORIGIN_ENV_PREFIX)
+        && b.iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_')
+}
+
+fn iroh_origin(b: &BackendEntry) -> Result<IrohOrigin, ConfigError> {
+    let id = &b.id;
+    if b.has_http_only_keys() {
+        return err(format!(
+            "backend {id:?}: url, timeouts and max_concurrent_per_grant are only valid for \
+             kind = \"http\""
+        ));
+    }
+    let Some(env) = b.origin_endpoint_env.clone() else {
+        return err(format!(
+            "backend {id:?}: kind = \"iroh\" needs origin_endpoint_env"
+        ));
+    };
+    if !valid_env_name(&env) {
+        return err(format!(
+            "backend {id:?}: origin_endpoint_env must be an upper-case variable name starting \
+             with {ORIGIN_ENV_PREFIX}"
+        ));
+    }
+    let max_response_bytes = b.max_response_bytes.unwrap_or(IROH_MAX_RESPONSE_BYTES);
+    if !(1024..=IROH_MAX_RESPONSE_BYTES).contains(&max_response_bytes) {
+        return err(format!(
+            "backend {id:?}: max_response_bytes must be 1024..={IROH_MAX_RESPONSE_BYTES} for \
+             kind = \"iroh\""
+        ));
+    }
+    Ok(IrohOrigin {
+        env,
+        origin_id: None,
+        max_response_bytes,
+    })
+}
+
+/// Fill in each iroh route's origin EndpointId from its environment variable
+/// (PHASE4.md §1.2, D6): it must be set and hold exactly 64 lowercase hex
+/// characters that decode to a valid Ed25519 point, and no two routes may name
+/// the same origin. Error messages name the variable, never its value.
+pub fn resolve_origins(
+    routes: &mut [Route],
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    let mut seen: Vec<EndpointId> = Vec::new();
+    for route in routes.iter_mut() {
+        let Some(iroh) = route.iroh.as_mut() else {
+            continue;
+        };
+        let Some(value) = get(&iroh.env) else {
+            return err(format!(
+                "backend {:?}: {} is not set (the origin EndpointId, 64 lowercase hex)",
+                route.id, iroh.env
+            ));
+        };
+        let Some(id) = edge_tunnel::ids::parse_endpoint_id_hex(&value) else {
+            return err(format!(
+                "backend {:?}: {} must be exactly 64 lowercase hex characters encoding a valid \
+                 EndpointId",
+                route.id, iroh.env
+            ));
+        };
+        if seen.contains(&id) {
+            return err(format!(
+                "backend {:?}: another route already uses this origin EndpointId",
+                route.id
+            ));
+        }
+        seen.push(id);
+        iroh.origin_id = Some(id);
+    }
+    Ok(())
 }
 
 fn private_or_loopback(ip: IpAddr) -> bool {
@@ -334,44 +453,62 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
         let kind = match b.kind.as_str() {
             "echo" => RouteKind::Echo,
             "http" => RouteKind::Http,
-            "iroh" => {
-                return err(format!(
-                    "backend {:?}: kind {:?} is not available in this phase",
-                    b.id, b.kind
-                ))
-            }
+            "iroh" => RouteKind::Iroh,
             other => return err(format!("backend {:?}: unknown kind {other:?}", b.id)),
         };
-        match b.consent.as_deref() {
-            None | Some("edge") => {}
-            Some("origin") => {
-                return err(format!(
-                    "backend {:?}: consent = \"origin\" is not available in this phase",
-                    b.id
-                ))
-            }
+        let consent = match b.consent.as_deref() {
+            None | Some("edge") => ConsentMode::Edge,
+            Some("origin") => ConsentMode::Origin,
             Some(other) => return err(format!("backend {:?}: unknown consent {other:?}", b.id)),
+        };
+        // v1: the origin decides exactly for iroh backends (PHASE4.md §5).
+        if (kind == RouteKind::Iroh) != (consent == ConsentMode::Origin) {
+            return err(format!(
+                "backend {:?}: kind = \"iroh\" requires consent = \"origin\" and vice versa",
+                b.id
+            ));
+        }
+        if kind != RouteKind::Iroh && b.origin_endpoint_env.is_some() {
+            return err(format!(
+                "backend {:?}: origin_endpoint_env is only valid for kind = \"iroh\"",
+                b.id
+            ));
         }
         let scopes = b.scopes.clone().unwrap_or_else(|| vec!["mcp".into()]);
-        if scopes.is_empty() || scopes.len() > 16 || !scopes.iter().all(|s| valid_scope(s)) {
+        // iroh: the scopes travel in the enrollment string and consent
+        // requests, which carry at most 4.
+        let max_scopes = if kind == RouteKind::Iroh { 4 } else { 16 };
+        if scopes.is_empty() || scopes.len() > max_scopes || !scopes.iter().all(|s| valid_scope(s))
+        {
             return err(format!("backend {:?}: invalid scopes", b.id));
         }
         let lifetime = b.grant_lifetime_secs.unwrap_or(DEFAULT_GRANT_LIFETIME);
-        if !(300..=90 * 86_400).contains(&lifetime) {
+        let max_lifetime = if kind == RouteKind::Iroh {
+            edge_tunnel::meta::MAX_GRANT_LIFETIME_SECS as i64
+        } else {
+            90 * 86_400
+        };
+        if !(300..=max_lifetime).contains(&lifetime) {
             return err(format!(
-                "backend {:?}: grant_lifetime_secs must be 300..=7776000",
+                "backend {:?}: grant_lifetime_secs must be 300..={max_lifetime}",
                 b.id
             ));
         }
-        let max_request_bytes = b.max_request_bytes.unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
-        if !(1024..=MAX_REQUEST_BYTES_LIMIT).contains(&max_request_bytes) {
+        let (default_request, request_limit) = if kind == RouteKind::Iroh {
+            (IROH_MAX_REQUEST_BYTES, IROH_MAX_REQUEST_BYTES)
+        } else {
+            (DEFAULT_MAX_REQUEST_BYTES, MAX_REQUEST_BYTES_LIMIT)
+        };
+        let max_request_bytes = b.max_request_bytes.unwrap_or(default_request);
+        if !(1024..=request_limit).contains(&max_request_bytes) {
             return err(format!(
-                "backend {:?}: max_request_bytes must be 1024..=4194304",
+                "backend {:?}: max_request_bytes must be 1024..={request_limit}",
                 b.id
             ));
         }
-        let http = match kind {
-            RouteKind::Http => Some(http_upstream(&b)?),
+        let (http, iroh) = match kind {
+            RouteKind::Http => (Some(http_upstream(&b)?), None),
+            RouteKind::Iroh => (None, Some(iroh_origin(&b)?)),
             RouteKind::Echo => {
                 if b.has_http_keys() {
                     return err(format!(
@@ -379,7 +516,7 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
                         b.id
                     ));
                 }
-                None
+                (None, None)
             }
         };
         let display_name = b
@@ -393,7 +530,9 @@ pub fn parse_routes(text: &str) -> Result<Vec<Route>, ConfigError> {
             scopes,
             grant_lifetime_secs: lifetime,
             max_request_bytes,
+            consent,
             http,
+            iroh,
         });
     }
     Ok(routes)
@@ -545,7 +684,8 @@ impl EdgeConfig {
         let routes_path = get("EDGE_ROUTES").unwrap_or_else(|| "/etc/mcp-edge/routes.toml".into());
         let routes_text = read_file(&routes_path)
             .map_err(|_| ConfigError("EDGE_ROUTES file is not readable".into()))?;
-        let routes = parse_routes(&routes_text)?;
+        let mut routes = parse_routes(&routes_text)?;
+        resolve_origins(&mut routes, &get)?;
         let redirect_allowlist = match get("EDGE_REDIRECT_ALLOWLIST") {
             None => vec![CLAUDE_CALLBACK.to_string()],
             Some(list) => {
@@ -665,6 +805,20 @@ display_name = "Echo"
             hevy.http.as_ref().unwrap().url.as_str(),
             "https://hevy-mcp.app.stri.nz/mcp"
         );
+        // The documented (commented-out) wiskit route stays valid when enabled.
+        let shipped = include_str!("../config/routes.toml");
+        let start = shipped.find("# [[backend]]\n# id = \"wiskit\"").unwrap();
+        let block: String = shipped[start..]
+            .lines()
+            .map(|l| l.strip_prefix("# ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut wiskit = parse_routes(&block).unwrap();
+        assert_eq!(wiskit[0].kind, RouteKind::Iroh);
+        assert_eq!(wiskit[0].iroh.as_ref().unwrap().env, "EDGE_ORIGIN_WISKIT");
+        assert_eq!(wiskit[0].scopes, vec!["wiskit:read"]);
+        resolve_origins(&mut wiskit, |_| Some(ORIGIN_HEX.to_string())).unwrap();
+        assert!(resolve_origins(&mut wiskit, |_| None).is_err());
     }
 
     fn http_route(extra: &str) -> Result<Vec<Route>, ConfigError> {
@@ -799,6 +953,7 @@ display_name = "Echo"
             "[[backend]]\nid = \"x\"\nkind = \"http\"\n",
             "[[backend]]\nid = \"x\"\nkind = \"echo\"\nmax_response_bytes = 4096\n",
             "[[backend]]\nid = \"x\"\nkind = \"iroh\"\n",
+            "[[backend]]\nid = \"x\"\nkind = \"iroh\"\nconsent = \"edge\"\n",
             "[[backend]]\nid = \"x\"\nkind = \"echo\"\nconsent = \"origin\"\n",
             "[[backend]]\nid = \"x\"\nkind = \"echo\"\nurl = \"http://10.0.0.1\"\n",
             "[[backend]]\nid = \"owner\"\nkind = \"echo\"\n",
@@ -808,6 +963,92 @@ display_name = "Echo"
             "",
         ] {
             assert!(parse_routes(bad).is_err(), "{bad}");
+        }
+    }
+
+    const ORIGIN_HEX: &str = "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394";
+
+    fn iroh_route(extra: &str) -> Result<Vec<Route>, ConfigError> {
+        parse_routes(&format!(
+            "[[backend]]\nid = \"wiskit\"\nkind = \"iroh\"\nconsent = \"origin\"\n\
+             scopes = [\"wiskit:read\"]\n{extra}\n"
+        ))
+    }
+
+    #[test]
+    fn iroh_backend_keys_defaults_and_limits() {
+        let routes =
+            iroh_route("origin_endpoint_env = \"EDGE_ORIGIN_WISKIT\"\ngrant_lifetime_secs = 86400")
+                .unwrap();
+        let r = &routes[0];
+        assert_eq!((r.kind, r.consent), (RouteKind::Iroh, ConsentMode::Origin));
+        let iroh = r.iroh.as_ref().unwrap();
+        assert_eq!(iroh.env, "EDGE_ORIGIN_WISKIT");
+        assert_eq!(iroh.origin_id, None);
+        assert_eq!(iroh.max_response_bytes, IROH_MAX_RESPONSE_BYTES);
+        assert_eq!(r.max_request_bytes, IROH_MAX_REQUEST_BYTES);
+        assert!(r.http.is_none());
+        for bad in [
+            "",                                             // env missing
+            "origin_endpoint_env = \"EDGE_ENROLL_CODE\"",   // wrong prefix
+            "origin_endpoint_env = \"EDGE_ORIGIN_\"",       // prefix only
+            "origin_endpoint_env = \"EDGE_ORIGIN_wiskit\"", // lower case
+            "origin_endpoint_env = \"EDGE_ORIGIN_W\"\nurl = \"https://x.example/mcp\"",
+            "origin_endpoint_env = \"EDGE_ORIGIN_W\"\nmax_response_bytes = 2097152",
+            "origin_endpoint_env = \"EDGE_ORIGIN_W\"\nmax_request_bytes = 65537",
+            "origin_endpoint_env = \"EDGE_ORIGIN_W\"\ngrant_lifetime_secs = 2592001",
+            "origin_endpoint_env = \"EDGE_ORIGIN_W\"\nconnect_timeout_secs = 2",
+            "origin_endpoint_env = \"EDGE_ORIGIN_W\"\nscopes = [\"a\",\"b\",\"c\",\"d\",\"e\"]",
+        ] {
+            assert!(iroh_route(bad).is_err(), "{bad}");
+        }
+        // origin_endpoint_env on a non-iroh backend.
+        assert!(parse_routes(
+            "[[backend]]\nid = \"e\"\nkind = \"echo\"\norigin_endpoint_env = \"EDGE_ORIGIN_X\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn iroh_origin_ids_come_from_env_and_are_strict_and_unique() {
+        let table = "[[backend]]\nid = \"a\"\nkind = \"iroh\"\nconsent = \"origin\"\n\
+                     origin_endpoint_env = \"EDGE_ORIGIN_A\"\n\
+                     [[backend]]\nid = \"b\"\nkind = \"iroh\"\nconsent = \"origin\"\n\
+                     origin_endpoint_env = \"EDGE_ORIGIN_B\"\n";
+        let other = edge_tunnel::ids::endpoint_id_hex(
+            &edge_tunnel::iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+        );
+        let mut routes = parse_routes(table).unwrap();
+        resolve_origins(
+            &mut routes,
+            env(&[("EDGE_ORIGIN_A", ORIGIN_HEX), ("EDGE_ORIGIN_B", &other)]),
+        )
+        .unwrap();
+        assert_eq!(
+            edge_tunnel::ids::endpoint_id_hex(&routes[0].iroh.as_ref().unwrap().origin_id.unwrap()),
+            ORIGIN_HEX
+        );
+        let upper = ORIGIN_HEX.to_uppercase();
+        let short = &ORIGIN_HEX[..62];
+        let padded = format!("{ORIGIN_HEX} ");
+        for (a, b) in [
+            (None, Some(other.as_str())),                  // unset
+            (Some(""), Some(other.as_str())),              // empty
+            (Some(upper.as_str()), Some(other.as_str())),  // not lower case
+            (Some(short), Some(other.as_str())),           // too short
+            (Some(padded.as_str()), Some(other.as_str())), // whitespace
+            (Some(ORIGIN_HEX), Some(ORIGIN_HEX)),          // duplicate origin
+        ] {
+            let mut routes = parse_routes(table).unwrap();
+            let mut pairs = Vec::new();
+            if let Some(a) = a {
+                pairs.push(("EDGE_ORIGIN_A", a));
+            }
+            if let Some(b) = b {
+                pairs.push(("EDGE_ORIGIN_B", b));
+            }
+            let e = resolve_origins(&mut routes, env(&pairs)).unwrap_err();
+            assert!(!e.0.contains(ORIGIN_HEX), "never echo the value: {e}");
         }
     }
 

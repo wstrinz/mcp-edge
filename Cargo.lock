@@ -1859,6 +1859,8 @@ dependencies = [
  "bytes",
  "edge-assert",
  "edge-auth",
+ "edge-origin",
+ "edge-tunnel",
  "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
