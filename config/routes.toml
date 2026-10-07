@@ -29,20 +29,18 @@ response_timeout_secs = 20                # time to response headers (<= 25)
 idle_timeout_secs = 60                    # longest gap between body chunks
 max_concurrent_per_grant = 4              # in-flight requests + open streams
 
-# Wiskit on the home PC over iroh (phase 4). DISABLED: uncomment only after
-# the owner has set the Coolify secret EDGE_ORIGIN_WISKIT to the app's own
-# EndpointId (64 lowercase hex, shown in Wiskit under Remote access) and the
-# Wiskit build with remote access exists. With this entry enabled, a missing
-# or malformed EDGE_ORIGIN_WISKIT stops the edge at startup (no silent
-# fallback). The EndpointId never goes into git; only the variable name does.
-#
-# [[backend]]
-# id = "wiskit"                        # public URL: https://<edge>/wiskit/mcp
-# kind = "iroh"
-# consent = "origin"                   # the app decides trackers and lifetime
-# display_name = "Wiskit (home PC)"
-# scopes = ["wiskit:read"]
-# grant_lifetime_secs = 86400          # trial ceiling; the owner picks <= this in the app
-# max_request_bytes = 65536            # <= 64 KiB (tunnel cap)
-# max_response_bytes = 1048576         # <= 1 MiB (tunnel cap)
-# origin_endpoint_env = "EDGE_ORIGIN_WISKIT"   # must start with EDGE_ORIGIN_
+# Wiskit over iroh (phase 4). EDGE_ORIGIN_WISKIT (Coolify) holds the app's own
+# EndpointId: 64 lowercase hex, shown in Wiskit under Settings > Remote access.
+# A missing or malformed value stops the edge at startup (no silent fallback),
+# so set and read back the variable BEFORE merging any change here. The
+# EndpointId never goes into git; only the variable name does.
+[[backend]]
+id = "wiskit"                        # public URL: https://<edge>/wiskit/mcp
+kind = "iroh"
+consent = "origin"                   # the app decides trackers and lifetime
+display_name = "Wiskit (home PC)"
+scopes = ["wiskit:read"]
+grant_lifetime_secs = 86400          # trial ceiling; the owner picks <= this in the app
+max_request_bytes = 65536            # <= 64 KiB (tunnel cap)
+max_response_bytes = 1048576         # <= 1 MiB (tunnel cap)
+origin_endpoint_env = "EDGE_ORIGIN_WISKIT"   # must start with EDGE_ORIGIN_

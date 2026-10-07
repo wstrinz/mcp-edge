@@ -196,9 +196,10 @@ Revoking at `/owner` (or RFC 7009, refresh replay, expiry) also tells the app
 
 **Enrollment (owner, both sides).**
 
-1. Uncomment the `wiskit` entry in `config/routes.toml` (on a branch; merging to
-   `main` deploys) and set the Coolify secret `EDGE_ORIGIN_WISKIT` to the
-   EndpointId Wiskit shows under Settings → Agent access → Remote access.
+1. Set the Coolify secret `EDGE_ORIGIN_WISKIT` to the EndpointId Wiskit shows
+   under Settings → Agent access → Remote access, and read it back. The `wiskit`
+   entry in `config/routes.toml` is enabled, so the edge refuses to start
+   without a valid value: set the secret before the deploy that needs it.
 2. Deploy. The startup log shows `iroh edge_id=...`; a changed
    `EDGE_ORIGIN_WISKIT` revokes all wiskit grants (`event=origin_reenrolled`).
 3. Sign in at `/owner`. Under **Local apps (enrollment)** copy the
