@@ -795,8 +795,8 @@ display_name = "Echo"
 
     #[test]
     fn shipped_route_table_is_valid() {
-        let routes = parse_routes(include_str!("../config/routes.toml")).unwrap();
-        assert_eq!(routes.len(), 2);
+        let mut routes = parse_routes(include_str!("../config/routes.toml")).unwrap();
+        assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].id, "echo");
         assert_eq!(routes[0].kind, RouteKind::Echo);
         let hevy = &routes[1];
@@ -805,20 +805,16 @@ display_name = "Echo"
             hevy.http.as_ref().unwrap().url.as_str(),
             "https://hevy-mcp.app.stri.nz/mcp"
         );
-        // The documented (commented-out) wiskit route stays valid when enabled.
-        let shipped = include_str!("../config/routes.toml");
-        let start = shipped.find("# [[backend]]\n# id = \"wiskit\"").unwrap();
-        let block: String = shipped[start..]
-            .lines()
-            .map(|l| l.strip_prefix("# ").unwrap_or(l))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut wiskit = parse_routes(&block).unwrap();
-        assert_eq!(wiskit[0].kind, RouteKind::Iroh);
-        assert_eq!(wiskit[0].iroh.as_ref().unwrap().env, "EDGE_ORIGIN_WISKIT");
-        assert_eq!(wiskit[0].scopes, vec!["wiskit:read"]);
-        resolve_origins(&mut wiskit, |_| Some(ORIGIN_HEX.to_string())).unwrap();
-        assert!(resolve_origins(&mut wiskit, |_| None).is_err());
+        let wiskit = &routes[2];
+        assert_eq!(
+            (wiskit.id.as_str(), wiskit.kind),
+            ("wiskit", RouteKind::Iroh)
+        );
+        assert_eq!(wiskit.iroh.as_ref().unwrap().env, "EDGE_ORIGIN_WISKIT");
+        assert_eq!(wiskit.scopes, vec!["wiskit:read"]);
+        // The origin EndpointId comes only from the environment; without it the edge refuses to start.
+        assert!(resolve_origins(&mut routes, |_| None).is_err());
+        resolve_origins(&mut routes, |_| Some(ORIGIN_HEX.to_string())).unwrap();
     }
 
     fn http_route(extra: &str) -> Result<Vec<Route>, ConfigError> {
