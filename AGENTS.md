@@ -5,7 +5,10 @@ This repository prepares an optional HTTPS/iroh edge for Wiskit. The root
 `EDGE_MODE=edge`, the phase 2 OAuth authorization server (`crates/edge-auth`),
 signed assertions (`crates/edge-assert`), the built-in `echo` backend and
 (phase 3) `kind = "http"` backends whose upstream URLs are fixed in the route
-table (`src/forward.rs`); the shipped table enables no http backend. Read
+table (`src/forward.rs`) and (phase 4) `kind = "iroh"` backends with origin
+consent, dialling only the EndpointId named by an `EDGE_ORIGIN_*` variable
+(`src/tunnel.rs`, `crates/edge-tunnel`, `crates/edge-origin`); the shipped
+table enables neither (the wiskit route is commented out). Read
 README.md, docs/DESIGN.md (current plan and phase 2/3 notes), docs/COOLIFY.md
 and docs/BUILDER-HANDOFF.md first.
 

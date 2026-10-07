@@ -12,7 +12,7 @@ root = Path(__file__).resolve().parents[1]
 compose = yaml.safe_load((root / "compose.yaml").read_text(encoding="utf-8"))
 # Reviewed phase 2 deployment shape: unprivileged, read-only, capability-free,
 # bounded; reachable only through the proxy network (expose, no host ports);
-# one named volume for the SQLite store and assertion key.
+# one named volume for the SQLite store and the assertion (and iroh) keys.
 expected = {
     "services": {
         "edge": {
@@ -28,6 +28,7 @@ expected = {
                 "EDGE_DATA_DIR": "/data",
                 "EDGE_ROUTES": "/etc/mcp-edge/routes.toml",
                 "EDGE_ENROLL_CODE": "${EDGE_ENROLL_CODE:-}",
+                "EDGE_ORIGIN_WISKIT": "${EDGE_ORIGIN_WISKIT:-}",
             },
             "expose": ["8080"],
             "volumes": ["edge-data:/data"],

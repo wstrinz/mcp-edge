@@ -1,6 +1,9 @@
 # Phase 4: Wiskit as an iroh backend of mcp-edge
 
-Status: specification draft for owner review, 2026-10-06. Nothing here is implemented.
+Status: specification accepted 2026-10-06 (D1–D15 as recommended). Implemented on
+the edge side: `edge-tunnel` and `edge-origin` (§9, merged), the gateway iroh
+forwarder and origin consent (§10, branch `phase4-edge`). The Wiskit side (§4, §6)
+is not implemented.
 Branch `phase4-spec`. Baselines read: this repo at `f4033a0` (phase 2 merged; phase 3, the
 HTTP forwarder, is being built in parallel), Wiskit `wiskit-iroh` `main` at `c53f804`
 (release 1.6.2).
@@ -760,3 +763,43 @@ Open points for the gateway and Wiskit work:
   `origin_timeout`.
 * `VerifiedGrant.resource_scope` is the edge-signed copy; Wiskit must still
   authorize from its own record (§4.2) and use the assertion only for identity.
+
+## 10. Edge implementation notes (gateway + origin consent)
+
+Built on branch `phase4-edge` (phase 4A, edge side): `src/tunnel.rs` (identity,
+endpoint, per-route `OriginClient`, the consent port, `grant_sync`,
+`grant_revoke`, `/owner` panels), `src/app.rs` (iroh forwarding),
+`src/config.rs` (route keys), and in `edge-auth` the origin consent state machine
+(`ConsentMode::Origin`, `origin::OriginPort`, routes `/consent/{start,status,
+finish,cancel}`). Tested on Windows against a fake origin built on `edge-origin`
+over loopback iroh (`tests/iroh_backend.rs`). Where the spec was silent or
+ambiguous, the conservative reading below was implemented.
+
+| # | Topic | Resolution |
+|---|---|---|
+| E1 | Where origin consent state lives (§3.2, §5 "pending row gains …") | In memory in `AuthState`, keyed by the pending id: stage, attempts, pairing code, grant id, abort handle. Not in the `pending` table: the tunnel stream that carries a consent request does not survive a restart either, and pairing codes and nonces never touch the disk. A restart mid-consent leaves the pending row in `proved`; the owner starts again (new code). The `grants` table gains `approval` (evidence), added in place to existing databases. |
+| E2 | Freshness of the passkey proof | Required (≤ 5 min, as phase 2) for `POST /consent/start` (every attempt, also retries) and for Deny on `POST /consent`. Not required for `/consent/finish` and `/consent/cancel`: both are bound to the browser cookie + CSRF, and the decision came from the app owner. Approve on `POST /consent` is refused (400) for origin backends; only `/consent/finish` after a verified approval issues a code. |
+| E3 | When `sent` is entered | When the request is handed to the tunnel (the protocol has no separate "accepted" signal). A failed dial moves to `origin_unreachable` within ≤ 3 s. |
+| E4 | Outcome classification | Verified approve → `approved`; verified deny → `denied`; `consent_busy` → `origin_unreachable` (own message); any other refusal, transport error or **invalid approval** → `origin_unreachable` with a reason (`event=origin_approval_invalid reason=<code>` is logged for the latter); no answer by `expires_at`, or the stream ending at/after it (1 s slack: `expires_at` has whole-second resolution) → `origin_timeout`. Attempts (3) and the window (180 s) are `Limits::origin_consent_attempts` / `origin_consent_secs`. |
+| E5 | Clock for `requested_at`/`expires_at` | The gateway stamps them with system time (the origin checks them against its own clock); the window length comes from `edge-auth`. Approvals are verified against system time too. |
+| E6 | Grant created at finish | In one transaction with the code, with the attempt's `grant_id`, `resource_scope` = the approved scope object, `expires` = time the approval was verified + min(approved lifetime, route `grant_lifetime_secs`), `gen = 1`, the approval string stored. Refresh keeps `resource_scope` unchanged (tested). |
+| E7 | Missing client name | Sent as `(no name given)`; the wire requires a non-empty `client_name`. |
+| E8 | `gen` in `grant_revoke` | The value the grant's assertions carried (the pre-revocation `gen`, 1 today), i.e. what the origin stored; the edge's own row then holds gen + 1. |
+| E9 | Which revocations notify the origin | `owner` (`/owner` revoke and revoke all), `client` (RFC 7009, and a failed code exchange of a not-yet-active grant), `replay` (refresh family revocation, code reuse), `expired` (absolute lifetime passed, found by the 60 s janitor; and codes never exchanged, when their pending grant is cleaned up after 1 h). Best effort from a background task, logged as `event=grant_revoke_sent … result=`. Revocations the origin caused (refusals, `grant_sync`) are not echoed back. |
+| E10 | `grant_sync` scope | On every new connection (`subscribe_connections`), the backend's `active`, unexpired grants in batches of ≤ 64; grants whose code was not yet exchanged are not included. `revoked` / `unknown` → revoked at the edge (`event=grant_sync_revoked`). |
+| E11 | Re-enrollment (§1.2 Change) | At startup `meta('origin:<route>')` is compared with the configured id; a different id revokes all grants of the route (gen++) and logs `event=origin_reenrolled`. The first binding also revokes any live grants of the route (none can exist). |
+| E12 | Edge endpoint | Created only when the table has an iroh route. `presets::Minimal` + `default_relay_mode()` (n0) + `PkarrResolver::n0_dns()` + `DnsAddressLookup::n0_dns()`; no `PkarrPublisher` (nothing published), no portmapper (iroh's feature is off), no ALPN (inbound connections fail the handshake), `edge_tunnel::transport_config()`. Bind is bounded by 10 s; a failure is logged (`event=iroh_unavailable`) and the route answers `origin_offline`; `/healthz` and `/readyz` are unaffected. |
+| E13 | Route keys | `origin_endpoint_env` must start with `EDGE_ORIGIN_` (a route can never name another secret); its value is checked strictly (no trimming) and never echoed in errors. **Deviation:** `max_response_bytes` for iroh is ≤ 1 MiB (§5 said ≤ 4 MiB): the tunnel's `mcp_post` cap is 1 MiB, so a larger value could not be honoured. `max_request_bytes` ≤ 64 KiB, `scopes` ≤ 4, `grant_lifetime_secs` ≤ 30 days (the wire bounds). |
+| E14 | Request handling | POST only (405 `Allow: POST`); phase 3 header rules (400 on repeated/malformed allowlisted headers) though no header crosses; `accept` = `json_or_sse` iff `Accept` lists `text/event-stream`; empty body → 400. Budget = min(25 s, 28 s − time since the handler started). JSON answers are read completely (≤ the route cap) before responding, so a truncated answer is a clean `502 backend_protocol`; SSE is streamed (`x-accel-buffering: no`) and a broken stream ends the chunked body without its terminator. An MCP-level 401 without `error` is `502 backend_rejected` (as phase 3). Response headers: `content-type`, `cache-control: no-store`. |
+| E15 | Errors §2.7 left open | Edge in-flight limits (`EdgeBusy`) → `429 too_many_in_flight`, `Retry-After: 1`; origin `busy` → 429 with its `retry_after` (or 1); deadline → `504 upstream_timeout`; protocol/truncation/oversize → `502 backend_protocol`. The 503 messages use the route's `display_name` ("Wiskit (home PC) is not reachable: …") rather than a literal "Wiskit". `origin_dial_failed` is not a separate event: the client reports dial failure and the offline window alike, logged as `event=origin_offline`. |
+| E16 | `/owner` | Per iroh route: enrollment string (textarea), fingerprint, edge EndpointId, assertion key, issuer, owner id, scopes, the configured origin id in full and as first 8 … last 4, and the last `ping` result (a background ping starts when the page loads, at most every 10 s; the result shows on the next load). No separate origin fingerprint scheme was introduced: the app displays its full EndpointId. |
+| E17 | Compose | References `EDGE_ORIGIN_WISKIT` (empty default) so the Coolify secret reaches the container; ignored while the route is commented out. |
+
+Open points:
+
+* How claude.ai presents the 503 contract and a mid-flow `access_denied` is still
+  an acceptance item (4D).
+* Whether `grant_revoke` should carry the post-revocation `gen` instead (E8) needs
+  the Wiskit implementation to agree; the origin crate passes it through.
+* No Linux image build was run on this branch; the release build time was
+  measured on Windows only.

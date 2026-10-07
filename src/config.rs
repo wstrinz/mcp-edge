@@ -805,6 +805,20 @@ display_name = "Echo"
             hevy.http.as_ref().unwrap().url.as_str(),
             "https://hevy-mcp.app.stri.nz/mcp"
         );
+        // The documented (commented-out) wiskit route stays valid when enabled.
+        let shipped = include_str!("../config/routes.toml");
+        let start = shipped.find("# [[backend]]\n# id = \"wiskit\"").unwrap();
+        let block: String = shipped[start..]
+            .lines()
+            .map(|l| l.strip_prefix("# ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut wiskit = parse_routes(&block).unwrap();
+        assert_eq!(wiskit[0].kind, RouteKind::Iroh);
+        assert_eq!(wiskit[0].iroh.as_ref().unwrap().env, "EDGE_ORIGIN_WISKIT");
+        assert_eq!(wiskit[0].scopes, vec!["wiskit:read"]);
+        resolve_origins(&mut wiskit, |_| Some(ORIGIN_HEX.to_string())).unwrap();
+        assert!(resolve_origins(&mut wiskit, |_| None).is_err());
     }
 
     fn http_route(extra: &str) -> Result<Vec<Route>, ConfigError> {
