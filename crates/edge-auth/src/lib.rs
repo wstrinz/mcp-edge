@@ -199,6 +199,7 @@ impl OriginStage {
 }
 
 struct OriginTx {
+    backend: String,
     stage: OriginStage,
     /// Attempts made so far (each with a fresh code, grant id and nonce).
     attempts: u32,
@@ -542,11 +543,18 @@ impl AuthState {
             Ok(ended) => self.notify_revoked(&ended, RevokeReason::Expired),
             Err(_) => self.log("event=store_error op=expiry_scan"),
         }
-        self.0
-            .origin_txs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, t| t.started + PENDING_TTL > now);
+        let stale: Vec<OriginTx> = {
+            let mut txs = self.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<String> = txs
+                .iter()
+                .filter(|(_, t)| t.started + PENDING_TTL <= now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| txs.remove(id)).collect()
+        };
+        for t in stale {
+            self.drop_unfinished(t, RevokeReason::Expired);
+        }
         if self.0.store.cleanup(now).is_err() {
             self.log("event=store_error op=cleanup");
         }
@@ -1368,11 +1376,23 @@ impl AuthState {
             .unwrap_or_else(|e| e.into_inner())
             .remove(tx);
         if let Some(t) = removed {
-            if let Some(task) = t.task {
-                task.abort();
-            }
             if matches!(t.stage, OriginStage::Sent) {
                 self.log("event=consent_cancelled");
+            }
+            self.drop_unfinished(t, RevokeReason::Client);
+        }
+    }
+
+    /// Forget an attempt that will never become a grant: stop it if it is
+    /// still running, and if the app had already approved (and so holds a
+    /// grant record), tell it the grant ends (`gen` 1, never used).
+    fn drop_unfinished(&self, t: OriginTx, reason: RevokeReason) {
+        if let Some(task) = t.task {
+            task.abort();
+        }
+        if matches!(t.stage, OriginStage::Approved { .. }) {
+            if let Some(port) = self.origin_port() {
+                port.revoked(&t.backend, &t.grant_id, 1, reason);
             }
         }
     }
@@ -1527,6 +1547,7 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
         expires_at: u64::try_from(now).unwrap_or(0) + timeout_secs,
     };
     let entry = OriginTx {
+        backend: backend.id.clone(),
         stage: OriginStage::Sent,
         attempts,
         pairing_code: ask.pairing_code.clone(),

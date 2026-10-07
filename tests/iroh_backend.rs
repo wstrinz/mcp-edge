@@ -947,6 +947,46 @@ async fn cancel_stops_the_prompt_and_denies() {
 }
 
 #[tokio::test]
+async fn cancelling_after_the_app_approved_tells_the_app() {
+    let mut s = setup().await;
+    let mut p = s.begin().await;
+    assert_eq!(s.start(&mut p).await, 303);
+    let code = pairing_code(&s.page(&mut p).await);
+    let prompt = s.origin.next_prompt().await;
+    let grant_id = prompt.request.grant_id.clone();
+    prompt
+        .decide
+        .send(OwnerDecision::Approve {
+            code,
+            trackers: vec!["t1".into()],
+            lifetime: 3600,
+        })
+        .ok()
+        .unwrap();
+    s.wait_state(&mut p, "approved").await;
+    // The owner changes their mind on the edge page before returning.
+    let res =
+        s.h.post_form(
+            &mut p.browser,
+            "/consent/cancel",
+            &[("tx", &p.tx), ("csrf", &p.csrf)],
+        )
+        .await;
+    assert_eq!(res.status(), 303);
+    let location = res.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(
+        query_param(&location, "error").as_deref(),
+        Some("access_denied")
+    );
+    assert!(query_param(&location, "code").is_none());
+    // The app's record for the never-issued grant is ended.
+    s.origin
+        .wait_event(&format!("revoke:{grant_id}:1:client"))
+        .await;
+    s.h.finish().await;
+}
+
+#[tokio::test]
 async fn unreachable_origin_allows_three_attempts_then_denies() {
     let mut s = setup().await;
     let _ = s.origin.router.shutdown().await;
