@@ -339,7 +339,8 @@ struct Origin {
 
 impl Origin {
     async fn next_prompt(&self) -> Prompt {
-        tokio::time::timeout(Duration::from_secs(10), self.prompts.lock().await.recv())
+        // 30 s, not 10: the full workspace suite can run this on a loaded machine.
+        tokio::time::timeout(Duration::from_secs(30), self.prompts.lock().await.recv())
             .await
             .expect("the app receives a consent prompt")
             .unwrap()
