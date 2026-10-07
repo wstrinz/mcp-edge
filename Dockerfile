@@ -16,14 +16,18 @@ COPY config ./config
 RUN cargo fetch --locked
 # The test suite runs before merge (see AGENTS.md), not here: a release-mode test build
 # doubled compile time and memory and got the build killed on the shared Coolify host.
-RUN --network=none set -eu; \
+# target/ is a BuildKit cache mount kept on the Coolify builder between deploys, so only
+# changed crates recompile (a cold build of the iroh tree is long on the shared host).
+# The cache is not part of the image, so the binary is copied out in this same step.
+RUN --network=none --mount=type=cache,id=mcp-edge-target,target=/build/target set -eu; \
     cargo build --locked --offline --release --bin mcp-edge; \
-    readelf -l target/release/mcp-edge > /tmp/program-headers; \
-    if grep -q INTERP /tmp/program-headers; then echo 'Refusing dynamically linked binary'; exit 1; fi; \
-    mkdir -p /out/data
+    mkdir -p /out/data; \
+    cp target/release/mcp-edge /out/mcp-edge; \
+    readelf -l /out/mcp-edge > /tmp/program-headers; \
+    if grep -q INTERP /tmp/program-headers; then echo 'Refusing dynamically linked binary'; exit 1; fi
 
 FROM scratch
-COPY --from=build /build/target/release/mcp-edge /mcp-edge
+COPY --from=build /out/mcp-edge /mcp-edge
 COPY config/routes.toml /etc/mcp-edge/routes.toml
 # A new named volume mounted at /data inherits this ownership.
 COPY --from=build --chown=65532:65532 /out/data /data
