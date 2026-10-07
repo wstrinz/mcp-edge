@@ -10,8 +10,9 @@ use serde_json::Value;
 use std::{future::Future, pin::Pin};
 
 /// What the edge sends the origin for one consent attempt (§3.3). Nothing from
-/// the browser (IP, user agent, cookies) is included.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the browser (IP, user agent, cookies) is included. No `Debug`: it holds
+/// the pairing code and nonce, which must never reach a log.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConsentAsk {
     /// Route id.
     pub backend: String,
@@ -36,8 +37,9 @@ pub struct ConsentAsk {
     pub expires_at: u64,
 }
 
-/// The origin's answer, already verified by the port.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The origin's answer, already verified by the port. No `Debug`: it holds
+/// the signed approval.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ConsentOutcome {
     /// A valid signed approval. `resource_scope` is the approved scope object
     /// (goes into every assertion), `lifetime_secs` ≤ the route maximum.

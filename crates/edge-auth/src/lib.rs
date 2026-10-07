@@ -171,8 +171,9 @@ struct Inner {
     expiry_scan: AtomicI64,
 }
 
-/// Where one origin consent attempt stands (PHASE4.md §3.2).
-#[derive(Clone, Debug)]
+/// Where one origin consent attempt stands (PHASE4.md §3.2). No `Debug`:
+/// it holds the signed approval.
+#[derive(Clone)]
 enum OriginStage {
     Sent,
     Unreachable(&'static str),
@@ -1566,8 +1567,6 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
         s.log("event=consent_origin_unreachable reason=origin_unavailable");
         return Ok(back);
     };
-    txs.insert(p.id.clone(), entry);
-    drop(txs);
     s.log(&format!(
         "event=consent_sent backend={} attempt={attempts}",
         backend.id
@@ -1596,13 +1595,17 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
         };
         state.finish_origin_attempt(&tx_id, attempts, outcome);
     });
-    let mut txs = s.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
-    match txs.get_mut(&p.id) {
-        Some(t) if t.attempts == attempts && matches!(t.stage, OriginStage::Sent) => {
-            t.task = Some(task.abort_handle());
-        }
-        _ => {}
-    }
+    // Spawned and registered under the same lock, so a cancel can never find
+    // the attempt without its abort handle (the task's own completion waits
+    // for this lock too).
+    txs.insert(
+        p.id.clone(),
+        OriginTx {
+            task: Some(task.abort_handle()),
+            ..entry
+        },
+    );
+    drop(txs);
     Ok(back)
 }
 

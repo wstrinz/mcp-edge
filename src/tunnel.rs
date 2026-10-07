@@ -417,6 +417,7 @@ impl OriginPort for Gateway {
                 .expires_at
                 .saturating_sub(ask.requested_at)
                 .clamp(1, edge_tunnel::timing::CONSENT.as_secs());
+            let expires_at = requested_at + window;
             let meta = ConsentRequestMeta {
                 v: PROTOCOL_VERSION,
                 tx: ask.tx.clone(),
@@ -430,7 +431,7 @@ impl OriginPort for Gateway {
                 requested_at,
                 scopes: ask.scopes,
                 max_lifetime_secs: backend.max_lifetime_secs,
-                expires_at: requested_at + window,
+                expires_at,
             };
             if meta.validate().is_err() {
                 auth.log(&format!(
@@ -447,7 +448,12 @@ impl OriginPort for Gateway {
                 Ok(Reply::Refused(r)) => {
                     return ConsentOutcome::Unreachable(r.edge_failure().reason())
                 }
-                Err(TunnelError::Timeout) => return ConsentOutcome::Timeout,
+                // Only "no answer by expires_at" is a timeout; a write or
+                // idle deadline on a half-dead connection is a transport
+                // failure the owner may retry.
+                Err(TunnelError::Timeout) if unix_now() + 1 >= expires_at as i64 => {
+                    return ConsentOutcome::Timeout
+                }
                 Err(TunnelError::EdgeBusy) => return ConsentOutcome::Busy,
                 Err(e) => return ConsentOutcome::Unreachable(e.edge_failure().reason()),
             };

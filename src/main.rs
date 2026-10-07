@@ -181,7 +181,11 @@ async fn run_edge() {
         loop {
             tokio::select! {
                 _ = janitor.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(60)) => auth.cleanup(),
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    // SQLite work stays off the two async workers.
+                    let auth = auth.clone();
+                    let _ = tokio::task::spawn_blocking(move || auth.cleanup()).await;
+                }
             }
         }
     });

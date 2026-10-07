@@ -780,7 +780,7 @@ ambiguous, the conservative reading below was implemented.
 | E1 | Where origin consent state lives (§3.2, §5 "pending row gains …") | In memory in `AuthState`, keyed by the pending id: stage, attempts, pairing code, grant id, abort handle. Not in the `pending` table: the tunnel stream that carries a consent request does not survive a restart either, and pairing codes and nonces never touch the disk. A restart mid-consent leaves the pending row in `proved`; the owner starts again (new code). The `grants` table gains `approval` (evidence), added in place to existing databases. |
 | E2 | Freshness of the passkey proof | Required (≤ 5 min, as phase 2) for `POST /consent/start` (every attempt, also retries) and for Deny on `POST /consent`. Not required for `/consent/finish` and `/consent/cancel`: both are bound to the browser cookie + CSRF, and the decision came from the app owner. Approve on `POST /consent` is refused (400) for origin backends; only `/consent/finish` after a verified approval issues a code. |
 | E3 | When `sent` is entered | When the request is handed to the tunnel (the protocol has no separate "accepted" signal). A failed dial moves to `origin_unreachable` within ≤ 3 s. |
-| E4 | Outcome classification | Verified approve → `approved`; verified deny → `denied`; `consent_busy` → `origin_unreachable` (own message); any other refusal, transport error or **invalid approval** → `origin_unreachable` with a reason (`event=origin_approval_invalid reason=<code>` is logged for the latter); no answer by `expires_at`, or the stream ending at/after it (1 s slack: `expires_at` has whole-second resolution) → `origin_timeout`. Attempts (3) and the window (180 s) are `Limits::origin_consent_attempts` / `origin_consent_secs`. |
+| E4 | Outcome classification | Verified approve → `approved`; verified deny → `denied`; `consent_busy` → `origin_unreachable` (own message); any other refusal, transport error or **invalid approval** → `origin_unreachable` with a reason (`event=origin_approval_invalid reason=<code>` is logged for the latter); no answer by `expires_at`, or the stream ending at/after it (1 s slack: `expires_at` has whole-second resolution) → `origin_timeout`; a tunnel deadline that fires earlier (request write, idle read on a half-dead connection) is `origin_unreachable`, so the owner can retry. Attempts (3) and the window (180 s) are `Limits::origin_consent_attempts` / `origin_consent_secs`. |
 | E5 | Clock for `requested_at`/`expires_at` | The gateway stamps them with system time (the origin checks them against its own clock); the window length comes from `edge-auth`. Approvals are verified against system time too. |
 | E6 | Grant created at finish | In one transaction with the code, with the attempt's `grant_id`, `resource_scope` = the approved scope object, `expires` = time the approval was verified + min(approved lifetime, route `grant_lifetime_secs`), `gen = 1`, the approval string stored. Refresh keeps `resource_scope` unchanged (tested). |
 | E7 | Missing client name | Sent as `(no name given)`; the wire requires a non-empty `client_name`. |
@@ -802,5 +802,7 @@ Open points:
   an acceptance item (4D).
 * Whether `grant_revoke` should carry the post-revocation `gen` instead (E8) needs
   the Wiskit implementation to agree; the origin crate passes it through.
-* No Linux image build was run on this branch; the release build time was
-  measured on Windows only.
+* No Linux image build was run on this branch (no Docker daemon locally). Windows
+  release builds of `--bin mcp-edge` from scratch with 2 jobs (as the Dockerfile):
+  238 s at `main` (191 crates) vs 533 s on this branch (326 crates; iroh and its
+  dependency tree); with 12 jobs 229 s. The binary grows from 8.6 to 17 MB (Windows).
