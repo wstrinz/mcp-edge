@@ -949,4 +949,120 @@ mod tests {
         store.grant_for_access("acc", t0 + 61).unwrap().unwrap();
         assert_eq!(last_used(&store, t0 + 61), Some(t0 + 61));
     }
+
+    fn grant(store: &Store, id: &str, backend: &str, t0: i64, lifetime: i64) {
+        store
+            .create_grant_with_code(
+                id,
+                "c",
+                backend,
+                "s",
+                "{\"v\":1}",
+                Some("approval.sig"),
+                t0 + lifetime,
+                &format!("code-{id}"),
+                "https://cb.test/",
+                "ch",
+                t0 + 60,
+                t0,
+            )
+            .unwrap();
+        store
+            .activate_grant(id, &format!("acc-{id}"), t0 + 900, &format!("ref-{id}"), t0)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn origin_rebinding_revokes_that_backends_grants_only() {
+        let store = Store::open(None).unwrap();
+        let t0 = 1_800_000_000;
+        store
+            .insert_client("c", None, &["https://cb.test/".to_string()], t0)
+            .unwrap();
+        // First binding: nothing stored yet, no grants.
+        assert_eq!(store.bind_origin("wiskit", "aa").unwrap(), (false, vec![]));
+        grant(&store, "g_1", "wiskit", t0, 3600);
+        grant(&store, "g_2", "echo", t0, 3600);
+        // Same id again: nothing happens.
+        assert_eq!(store.bind_origin("wiskit", "aa").unwrap(), (false, vec![]));
+        assert_eq!(
+            store.live_grants_for_backend("wiskit", t0).unwrap().len(),
+            1
+        );
+        // A different id: the backend's grants are revoked (gen++).
+        let (changed, revoked) = store.bind_origin("wiskit", "bb").unwrap();
+        assert!(changed);
+        assert_eq!(
+            revoked,
+            vec![Revoked {
+                id: "g_1".into(),
+                backend: "wiskit".into(),
+                gen: 1
+            }]
+        );
+        assert!(store
+            .live_grants_for_backend("wiskit", t0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.live_grants_for_backend("echo", t0).unwrap().len(), 1);
+        // Revoking again reports nothing.
+        assert_eq!(store.revoke_grant("g_1").unwrap(), None);
+    }
+
+    #[test]
+    fn grants_ending_without_revocation_are_reported_once() {
+        let store = Store::open(None).unwrap();
+        let t0 = 1_800_000_000;
+        store
+            .insert_client("c", None, &["https://cb.test/".to_string()], t0)
+            .unwrap();
+        grant(&store, "g_short", "wiskit", t0, 600);
+        grant(&store, "g_long", "wiskit", t0, 7200);
+        assert!(store
+            .ended_without_revocation(t0, t0 + 300)
+            .unwrap()
+            .is_empty());
+        let ended = store.ended_without_revocation(t0 + 300, t0 + 900).unwrap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].id, "g_short");
+        assert!(store
+            .ended_without_revocation(t0 + 900, t0 + 1500)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn phase2_databases_gain_the_approval_column() {
+        let path = std::env::temp_dir().join(format!(
+            "edge-auth-migrate-{}.db",
+            crate::support::random_id("")
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE grants (
+                    id TEXT PRIMARY KEY, client_id TEXT NOT NULL, backend TEXT NOT NULL,
+                    scope TEXT NOT NULL, resource_scope TEXT NOT NULL, created INTEGER NOT NULL,
+                    expires INTEGER NOT NULL, status TEXT NOT NULL, gen INTEGER NOT NULL,
+                    last_used INTEGER);
+                 INSERT INTO grants VALUES ('g_old','c','echo','mcp','{}',1,2,'active',1,NULL);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(Some(&path)).unwrap();
+        let approval: Option<String> = store
+            .conn()
+            .query_row("SELECT approval FROM grants WHERE id = 'g_old'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(approval, None);
+        drop(store);
+        // Opening again is a no-op.
+        drop(Store::open(Some(&path)).unwrap());
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 }

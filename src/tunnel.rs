@@ -410,6 +410,13 @@ impl OriginPort for Gateway {
             let Some(client) = backend.client.clone() else {
                 return ConsentOutcome::Unreachable("origin_offline");
             };
+            // The origin checks the window against its own clock: stamp it
+            // with system time, keeping the edge's chosen length.
+            let requested_at = u64::try_from(unix_now()).unwrap_or(0);
+            let window = ask
+                .expires_at
+                .saturating_sub(ask.requested_at)
+                .clamp(1, edge_tunnel::timing::CONSENT.as_secs());
             let meta = ConsentRequestMeta {
                 v: PROTOCOL_VERSION,
                 tx: ask.tx.clone(),
@@ -420,10 +427,10 @@ impl OriginPort for Gateway {
                 client_name: ask.client_name,
                 client_registered_at: ask.client_registered_at,
                 redirect_host: ask.redirect_host,
-                requested_at: ask.requested_at,
+                requested_at,
                 scopes: ask.scopes,
                 max_lifetime_secs: backend.max_lifetime_secs,
-                expires_at: ask.expires_at,
+                expires_at: requested_at + window,
             };
             if meta.validate().is_err() {
                 auth.log(&format!(

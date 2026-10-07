@@ -1563,9 +1563,14 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
         )
         .await
         .unwrap_or(ConsentOutcome::Timeout);
-        // A stream the origin closed at `expires_at` is "no decision".
+        // A stream the origin closed at `expires_at` is "no decision"
+        // (`expires_at` has whole-second resolution, hence the slack).
         let outcome = match outcome {
-            ConsentOutcome::Unreachable(_) if started.elapsed() >= limit => ConsentOutcome::Timeout,
+            ConsentOutcome::Unreachable(_)
+                if started.elapsed() + std::time::Duration::from_secs(1) >= limit =>
+            {
+                ConsentOutcome::Timeout
+            }
             other => other,
         };
         state.finish_origin_attempt(&tx_id, attempts, outcome);
