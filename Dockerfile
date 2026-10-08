@@ -2,7 +2,10 @@
 # Final compilation is offline after a locked public-registry fetch.
 FROM rust:1.93.0-alpine@sha256:69d7b9d9aeaf108a1419d9a7fcf7860dcc043e9dbd1ab7ce88e44228774d99e9 AS build
 WORKDIR /build
-ENV CARGO_BUILD_JOBS=2 \
+# Parallel rustc jobs: 2 keeps a small shared host responsive; the GitHub image
+# build passes 4 (its runners have the cores and nothing else to serve).
+ARG BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${BUILD_JOBS} \
     OPENSSL_STATIC=1
 # webauthn-rs needs OpenSSL; link it statically so the final image stays FROM scratch.
 # rusqlite builds its bundled SQLite with the C compiler.

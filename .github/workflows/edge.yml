@@ -1,0 +1,112 @@
+# Test every change; on main, build the image here (not on the Coolify host),
+# push it to GHCR and have Coolify deploy that exact tag. Coolify only pulls.
+#
+# Repository settings this needs:
+#   secret   COOLIFY_TOKEN     Coolify API token allowed to write envs and deploy
+#   variable COOLIFY_URL       e.g. https://app.stri.nz
+#   variable COOLIFY_APP_UUID  the mcp-edge application
+#   variable EDGE_URL          e.g. https://mcp.app.stri.nz (post-deploy health check)
+# The GHCR package must be public (Coolify pulls without credentials).
+name: edge
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edge-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust 1.93.0 (the version the lockfile and Dockerfile use)
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.93.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  image:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          build-args: BUILD_JOBS=4
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}:main', env.IMAGE) || '' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: edge-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Point Coolify at this image and deploy it
+        env:
+          TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+          URL: ${{ vars.COOLIFY_URL }}
+          APP: ${{ vars.COOLIFY_APP_UUID }}
+          EDGE: ${{ vars.EDGE_URL }}
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          api() { curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" -H 'Accept: application/json' \
+                  -H 'Content-Type: application/json' "$@"; }
+          body=$(jq -n --arg v "$TAG" '{key:"EDGE_IMAGE_TAG", value:$v, is_preview:false, is_literal:true,
+                                        is_buildtime:false, is_runtime:true}')
+          # compose.yaml's ${EDGE_IMAGE_TAG:-main} makes Coolify create the key: update it, else add it.
+          api -X PATCH "$URL/api/v1/applications/$APP/envs" -d "$body" >/dev/null \
+            || api -X POST "$URL/api/v1/applications/$APP/envs" -d "$body" >/dev/null
+          dep=$(api "$URL/api/v1/deploy?uuid=$APP&force=false" | jq -r '.deployments[0].deployment_uuid')
+          echo "deployment $dep for $TAG"
+          for _ in $(seq 1 60); do
+            status=$(api "$URL/api/v1/deployments/$dep" | jq -r .status)
+            echo "status: $status"
+            case "$status" in
+              finished) break ;;
+              failed|cancelled*) exit 1 ;;
+            esac
+            sleep 10
+          done
+          [ "$status" = finished ] || { echo "deployment did not finish in 10 min"; exit 1; }
+          for _ in $(seq 1 12); do
+            curl -sf "$EDGE/healthz" && exit 0
+            sleep 5
+          done
+          echo "edge not healthy after deploy"; exit 1

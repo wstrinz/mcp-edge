@@ -9,9 +9,10 @@
 # port is published for it, and the edge-data volume also holds iroh-edge.key.
 services:
   edge:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # Built and pushed by .github/workflows/edge.yml; the deploy job sets
+    # EDGE_IMAGE_TAG to the commit it built, so Coolify only pulls.
+    image: ghcr.io/wstrinz/wiskit-mcp-edge:${EDGE_IMAGE_TAG:-main}
+    pull_policy: always
     user: "65532:65532"
     read_only: true
     cap_drop: [ALL]
