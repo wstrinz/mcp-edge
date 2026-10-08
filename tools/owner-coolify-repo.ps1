@@ -17,8 +17,8 @@ $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'SilentlyContinue'
 $DebugPreference = 'SilentlyContinue'
 if ($PSVersionTable.PSVersion -lt [version]'7.4') { throw 'PowerShell 7.4+ is required.' }
-$name = 'wiskit-mcp-edge'
-$repository = 'wstrinz/wiskit-mcp-edge'
+$name = 'mcp-edge'
+$repository = 'wstrinz/mcp-edge'
 $branch = 'main'
 $apiBase = 'https://app.stri.nz/api/v1'
 $script:token = $null
@@ -31,7 +31,7 @@ function Field($Object, [string]$Key) {
 function Safe($Value) { return [regex]::Replace([string]$Value, '[^\x20-\x7e]', '?') }
 function Api([string]$Method, [string]$Path, $Body = $null) {
     $id = '[A-Za-z0-9-]{8,64}'
-    $read = $Method -eq 'GET' -and ($Path -match '^/(version|servers|projects|applications|github-apps)$' -or $Path -match "^/servers/$id/destinations$" -or $Path -match "^/projects/$id/production$" -or $Path -match '^/github-apps/[0-9]+/repositories(/wstrinz/wiskit-mcp-edge/branches)?$' -or $Path -match "^/applications/$id$")
+    $read = $Method -eq 'GET' -and ($Path -match '^/(version|servers|projects|applications|github-apps)$' -or $Path -match "^/servers/$id/destinations$" -or $Path -match "^/projects/$id/production$" -or $Path -match '^/github-apps/[0-9]+/repositories(/wstrinz/mcp-edge/branches)?$' -or $Path -match "^/applications/$id$")
     $write = $script:ownerConfirmed -and $Method -eq 'POST' -and $Path -in @('/projects', '/applications/private-github-app')
     if (-not ($read -or $write)) { throw 'API action is outside this reviewed setup scope.' }
     $uri = [uri]($apiBase + $Path)
@@ -92,7 +92,7 @@ try {
         $matchingRepos = @((Field $repos 'repositories') | Where-Object { (Field $_ 'full_name') -eq $repository })
         if ($matchingRepos.Count -ne 1) { throw 'Proposed repository is absent or inaccessible to this existing GitHub App. Publish it/add only its approved installation access first.' }
         if ((Field $matchingRepos[0] 'private') -ne $true) { throw 'The proposed repository is not verified private. No visibility or access changes occur.' }
-        $branches = Api 'GET' "/github-apps/$GithubSourceId/repositories/wstrinz/wiskit-mcp-edge/branches"
+        $branches = Api 'GET' "/github-apps/$GithubSourceId/repositories/wstrinz/mcp-edge/branches"
         $matchingBranches = @((Field $branches 'branches') | Where-Object { (Field $_ 'name') -eq $branch })
         if ($matchingBranches.Count -ne 1) { throw 'Deployment branch was not uniquely returned. No fallback or new branch is created.' }
         $commit = [string](Field (Field $matchingBranches[0] 'commit') 'sha')

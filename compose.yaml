@@ -11,7 +11,7 @@ services:
   edge:
     # Built and pushed by .github/workflows/edge.yml; the deploy job sets
     # EDGE_IMAGE_TAG to the commit it built, so Coolify only pulls.
-    image: ghcr.io/wstrinz/wiskit-mcp-edge:${EDGE_IMAGE_TAG:-main}
+    image: ghcr.io/wstrinz/mcp-edge:${EDGE_IMAGE_TAG:-main}
     pull_policy: always
     user: "65532:65532"
     read_only: true
