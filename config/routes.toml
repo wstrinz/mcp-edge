@@ -40,7 +40,7 @@ kind = "iroh"
 consent = "origin"                   # the app decides trackers and lifetime
 display_name = "Wiskit (home PC)"
 scopes = ["wiskit:read"]
-grant_lifetime_secs = 86400          # trial ceiling; the owner picks <= this in the app
+grant_lifetime_secs = 2592000        # 30 days (the tunnel maximum); the owner picks <= this in the app
 max_request_bytes = 65536            # <= 64 KiB (tunnel cap)
 max_response_bytes = 1048576         # <= 1 MiB (tunnel cap)
 origin_endpoint_env = "EDGE_ORIGIN_WISKIT"   # must start with EDGE_ORIGIN_

@@ -68,6 +68,10 @@ pub struct Limits {
     pub origin_consent_secs: u64,
     /// Origin consent: attempts per pending request (each with a new code).
     pub origin_consent_attempts: u32,
+    /// Origin consent: attempts given back per pending request when the app
+    /// refused before showing a prompt (off, not enrolled, asleep, locked,
+    /// busy). Each retry still takes a click and a fresh passkey proof.
+    pub origin_consent_refunds: u32,
 }
 
 impl Default for Limits {
@@ -85,6 +89,7 @@ impl Default for Limits {
             max_enroll_failures_global: 100,
             origin_consent_secs: 180,
             origin_consent_attempts: 3,
+            origin_consent_refunds: 10,
         }
     }
 }

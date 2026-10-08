@@ -199,15 +199,42 @@ impl OriginStage {
     }
 }
 
+/// Refusals that happen before the app shows any prompt (no pairing code
+/// revealed): the owner fixes the setup and retries without losing an attempt.
+const SETUP_REFUSALS: [&str; 9] = [
+    "origin_offline",
+    "origin_unavailable",
+    "origin_remote_off",
+    "origin_unenrolled",
+    "origin_rejected_edge",
+    "origin_locked",
+    "origin_paused",
+    "origin_busy",
+    "consent_busy",
+];
+
 struct OriginTx {
     backend: String,
     stage: OriginStage,
     /// Attempts made so far (each with a fresh code, grant id and nonce).
     attempts: u32,
+    /// Attempts given back because the app refused before showing a prompt.
+    refunds: u32,
     pairing_code: String,
     grant_id: String,
     started: i64,
     task: Option<tokio::task::AbortHandle>,
+}
+
+impl OriginTx {
+    /// Give the attempt back when the app refused before any prompt, up to
+    /// `max_refunds` times per request.
+    fn refund(&mut self, reason: &str, max_refunds: u32) {
+        if SETUP_REFUSALS.contains(&reason) && self.refunds < max_refunds && self.attempts > 0 {
+            self.attempts -= 1;
+            self.refunds += 1;
+        }
+    }
 }
 
 /// Shared authorization-server state. Cheap to clone.
@@ -1128,14 +1155,19 @@ fn origin_reason_text(reason: &str, app: &str) -> String {
     match reason {
         "origin_offline" | "origin_unavailable" => format!(
             "{app} is not reachable: the computer it runs on is off or asleep, or the app is \
-             closed."
+             closed. Open {app} on that computer, then press Try again."
         ),
-        "origin_remote_off" => format!("Remote access is turned off in {app}."),
+        "origin_remote_off" => format!(
+            "Remote access is turned off in {app}. In {app}, open Settings → Remote access and \
+             turn on “Allow remote access”, then press Try again."
+        ),
         "origin_unenrolled" | "origin_rejected_edge" => format!(
             "{app} does not recognize this edge. Paste the enrollment string from /owner into \
-             {app} and try again."
+             {app} (Settings → Remote access), then press Try again."
         ),
-        "origin_locked" => format!("{app} is locked or not ready yet. Unlock it and try again."),
+        "origin_locked" => {
+            format!("{app} is locked or still starting. Unlock it, then press Try again.")
+        }
         "origin_paused" => format!("Remote access in {app} is paused (its audit log failed)."),
         "consent_busy" => format!("{app} is already showing another access request."),
         "origin_busy" => format!("{app} is busy. Try again in a moment."),
@@ -1446,6 +1478,9 @@ impl AuthState {
                 OriginStage::Unreachable(reason)
             }
         };
+        if let OriginStage::Unreachable(reason) = t.stage {
+            t.refund(reason, self.config().limits.origin_consent_refunds);
+        }
     }
 }
 
@@ -1515,14 +1550,15 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
     let max_attempts = s.config().limits.origin_consent_attempts;
     let timeout_secs = s.config().limits.origin_consent_secs;
     let mut txs = s.0.origin_txs.lock().unwrap_or_else(|e| e.into_inner());
-    let attempts = match txs.get(&p.id) {
-        None => 0,
+    let (attempts, refunds) = match txs.get(&p.id) {
+        None => (0, 0),
         Some(t) if matches!(t.stage, OriginStage::Unreachable(_)) && t.attempts < max_attempts => {
-            t.attempts
+            (t.attempts, t.refunds)
         }
         // Already sent, decided, or out of attempts: just show the state.
         Some(_) => return Ok(back),
-    } + 1;
+    };
+    let attempts = attempts + 1;
     let ask = ConsentAsk {
         backend: backend.id.clone(),
         tx: p.id.clone(),
@@ -1551,19 +1587,22 @@ fn consent_start_inner(s: &AuthState, headers: &HeaderMap, body: &[u8]) -> Handl
         backend: backend.id.clone(),
         stage: OriginStage::Sent,
         attempts,
+        refunds,
         pairing_code: ask.pairing_code.clone(),
         grant_id: ask.grant_id.clone(),
         started: now,
         task: None,
     };
     let Some(port) = s.origin_port() else {
-        txs.insert(
-            p.id.clone(),
-            OriginTx {
-                stage: OriginStage::Unreachable("origin_unavailable"),
-                ..entry
-            },
+        let mut unreachable = OriginTx {
+            stage: OriginStage::Unreachable("origin_unavailable"),
+            ..entry
+        };
+        unreachable.refund(
+            "origin_unavailable",
+            s.config().limits.origin_consent_refunds,
         );
+        txs.insert(p.id.clone(), unreachable);
         s.log("event=consent_origin_unreachable reason=origin_unavailable");
         return Ok(back);
     };

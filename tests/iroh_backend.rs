@@ -988,12 +988,21 @@ async fn cancelling_after_the_app_approved_tells_the_app() {
 }
 
 #[tokio::test]
-async fn unreachable_origin_allows_three_attempts_then_denies() {
-    let mut s = setup().await;
+async fn unreachable_origin_refunds_then_allows_three_attempts_then_denies() {
+    // The app never showed a prompt, so the first tries are given back (here
+    // 2, by configuration); after that each try costs an attempt.
+    let mut s = setup_with(SetupOptions {
+        auth_limits: edge_auth::config::Limits {
+            origin_consent_refunds: 2,
+            ..Options::default().auth_limits
+        },
+        ..SetupOptions::default()
+    })
+    .await;
     let _ = s.origin.router.shutdown().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut p = s.begin().await;
-    for left in [2, 1, 0] {
+    for left in [3, 3, 2, 1, 0] {
         assert_eq!(s.start(&mut p).await, 303);
         let st = s.wait_state(&mut p, "origin_unreachable").await;
         assert_eq!(st["attempts_left"], left, "{st}");
@@ -1216,9 +1225,10 @@ async fn origin_refusing_consent_shows_the_reason_and_allows_retry() {
         .ok()
         .unwrap();
     let st = s.wait_state(&mut p, "origin_unreachable").await;
-    assert_eq!(st["attempts_left"], 2);
+    // A refusal before any decision (locked) does not use up an attempt.
+    assert_eq!(st["attempts_left"], 3);
     let page = s.page(&mut p).await;
-    assert!(page.contains("is locked or not ready"), "{page}");
+    assert!(page.contains("is locked or still starting"), "{page}");
     assert!(page.contains("Try again"));
     // Retry: a new pairing code and grant id; the owner mistypes the code,
     // so the app sends no decision (never an approval).
@@ -1238,9 +1248,10 @@ async fn origin_refusing_consent_shows_the_reason_and_allows_retry() {
         .ok()
         .unwrap();
     let st = s.wait_state(&mut p, "origin_unreachable").await;
-    assert_eq!(st["attempts_left"], 1);
+    // The owner saw this prompt and typed a code: that attempt counts.
+    assert_eq!(st["attempts_left"], 2);
     s.origin.wait_event("wrong_code").await;
-    // Last attempt: the right code.
+    // Next attempt: the right code.
     assert_eq!(s.start(&mut p).await, 303);
     let page = s.page(&mut p).await;
     let code = pairing_code(&page);

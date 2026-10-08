@@ -171,7 +171,9 @@ through `POST /consent/finish`. The edge verifies the app's signed approval
 route, tx, grant id, nonce and client) and only then issues a code; the grant
 carries the approved `resource_scope` and lifetime (≤ the route's
 `grant_lifetime_secs`). Denied in the app, no decision within 180 s, Cancel, or an
-unreachable app (3 attempts, each with a new code) all end in `access_denied`. An
+unreachable app (3 attempts, each with a new code; a refusal before the app shows
+a prompt, such as remote access off or not enrolled, is given back up to 10 times)
+all end in `access_denied`. An
 invalid approval of any kind is treated as "unreachable", never as approval.
 
 **Requests.** `POST /wiskit/mcp` only; bearer check as for every backend, then
