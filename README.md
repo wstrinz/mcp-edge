@@ -215,6 +215,22 @@ A wiped `edge-data` volume creates a new edge identity (and assertion key): past
 the new enrollment string into Wiskit. A changed Wiskit transport key needs a new
 `EDGE_ORIGIN_WISKIT`, a redeploy and a new connection in Claude.
 
+## Build and deploy
+
+Images are built on GitHub, not on the Coolify host (`.github/workflows/edge.yml`):
+
+- Every pull request runs `fmt`, `clippy -D warnings` and `cargo test` on Linux.
+- A merge to `main` also builds the image and pushes `ghcr.io/wstrinz/wiskit-mcp-edge:<commit>` (and `:main`).
+  The `deploy` job then sets the Coolify env `EDGE_IMAGE_TAG` to that commit, starts a deployment, and waits
+  for it and for `/healthz`.
+- Coolify only pulls (`compose.yaml` uses `image:`); its own auto-deploy on push stays **off**, so the
+  workflow is the one deploy path.
+- Rollback: re-run an older successful run's `deploy` job, or set `EDGE_IMAGE_TAG` to an older commit in
+  Coolify and redeploy.
+
+Repository settings: secret `COOLIFY_TOKEN` (a Coolify API token that can write envs and deploy),
+variables `COOLIFY_URL`, `COOLIFY_APP_UUID` and `EDGE_URL`. The GHCR package must be public.
+
 ## Deployment steps (owner; not performed)
 
 1. Generate an enrollment code (e.g. 32 random characters) and keep it private.
