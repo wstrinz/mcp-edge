@@ -14,9 +14,9 @@ The preferred route is the owner's existing ordinary Coolify workflow:
 GitHub repository -> existing Coolify GitHub App -> application -> Docker build
 on the selected server -> automatic deployment on the selected branch.
 
-The owner approved private `wstrinz/wiskit-mcp-edge`, branch `main`, for
+The owner approved private `wstrinz/mcp-edge`, branch `main`, for
 publication on 2026-10-05. Recommended pending Coolify choices: dedicated
-project/application `wiskit-mcp-edge`, production environment, base `/`,
+project/application `mcp-edge`, production environment, base `/`,
 Docker Compose build pack, Compose `/compose.yaml`, root Dockerfile. Select the
 actual server and standalone destination from the owner's existing account;
 none of their identifiers is known in this task.
@@ -78,13 +78,13 @@ One-time POST `/api/v1/applications/private-github-app`, with actual verified ID
 
 ```json
 {
-  "name": "wiskit-mcp-edge",
+  "name": "mcp-edge",
   "project_uuid": "<verified project UUID>",
   "environment_uuid": "<verified production environment UUID>",
   "server_uuid": "<verified server UUID>",
   "destination_uuid": "<verified standalone destination UUID>",
   "github_app_uuid": "<verified existing GitHub source UUID>",
-  "git_repository": "wstrinz/wiskit-mcp-edge",
+  "git_repository": "wstrinz/mcp-edge",
   "git_branch": "main",
   "git_commit_sha": "HEAD",
   "build_pack": "dockercompose",

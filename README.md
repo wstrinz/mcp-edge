@@ -1,7 +1,8 @@
-# mcp-edge (repository `wiskit-mcp-edge`)
+# mcp-edge
 
-Dedicated repository: **`wstrinz/wiskit-mcp-edge`**, private, with **`main`** as
-the intended Coolify deployment branch. **Current plan: [docs/DESIGN.md](docs/DESIGN.md)**:
+Repository **`wstrinz/mcp-edge`** (public; named `wiskit-mcp-edge` until 2026-10-08, and
+GitHub redirects the old name). **`main`** deploys through the GitHub workflow (see "Build and
+deploy"). **Current plan: [docs/DESIGN.md](docs/DESIGN.md)**:
 a generic, OAuth-hardened front door for all the owner's MCP servers, with Wiskit
 as the first iroh backend. The [builder handoff](docs/BUILDER-HANDOFF.md) still
 holds its safety rules and Wiskit details.
@@ -220,7 +221,7 @@ the new enrollment string into Wiskit. A changed Wiskit transport key needs a ne
 Images are built on GitHub, not on the Coolify host (`.github/workflows/edge.yml`):
 
 - Every pull request runs `fmt`, `clippy -D warnings` and `cargo test` on Linux.
-- A merge to `main` also builds the image and pushes `ghcr.io/wstrinz/wiskit-mcp-edge:<commit>` (and `:main`).
+- A merge to `main` also builds the image and pushes `ghcr.io/wstrinz/mcp-edge:<commit>` (and `:main`).
   The `deploy` job then sets the Coolify env `EDGE_IMAGE_TAG` to that commit, starts a deployment, and waits
   for it and for `/healthz`.
 - Coolify only pulls (`compose.yaml` uses `image:`); its own auto-deploy on push stays **off**, so the
