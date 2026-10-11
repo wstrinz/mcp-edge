@@ -152,6 +152,15 @@ turning remote access off, refuses further requests regardless of edge state.
 - Whether the iroh relay used by the edge should be n0's public relays or self-hosted.
 - CIMD (client ID metadata documents) once Claude's metadata URL can be pinned.
 
+## Resource scope: read_write and decks (2026-10-10)
+
+`ResourceScope` (edge-tunnel `approval.rs`) gains `access: "read_write"` and an optional `decks` list
+beside `trackers`, for the Wiskit app's agent write tools (its `docs/AGENT-WRITES.md`, PHASE4 D10). The
+edge only carries the scope in grants and assertions; the origin app enforces what it means. A read
+scope over trackers serializes exactly as before (`decks` is omitted when empty), so existing origins
+are unaffected. `edge-origin` adds `ConsentResponder::approve_scope(scope, lifetime)`; `approve` is the
+read-over-trackers case. Deploy the edge before an origin that approves the new shape.
+
 ## Phase 2 implementation notes
 
 Status 2026-10-05, branch `phase2-auth`: `edge-assert`, `edge-auth` and the `mcp-edge`

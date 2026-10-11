@@ -127,15 +127,26 @@ impl ConsentResponder {
             == 0
     }
 
-    /// Sign an approval for `trackers` (sorted/deduplicated here) and
+    /// Sign a read approval for `trackers` (sorted/deduplicated here) and
     /// `lifetime_secs` (`300..=max_lifetime_secs`), send it and wait for the
     /// edge to acknowledge it. Write the grant record first; drop it on `Err`.
     pub async fn approve(
-        mut self,
+        self,
         trackers: Vec<String>,
         lifetime_secs: u64,
     ) -> Result<(), ConsentError> {
         let scope = ResourceScope::read(trackers).map_err(ConsentError::InvalidDecision)?;
+        self.approve_scope(scope, lifetime_secs).await
+    }
+
+    /// Like [`Self::approve`] with any scope: read or read-write, over trackers
+    /// and/or decks (build it with [`ResourceScope::new`]).
+    pub async fn approve_scope(
+        mut self,
+        scope: ResourceScope,
+        lifetime_secs: u64,
+    ) -> Result<(), ConsentError> {
+        scope.validate().map_err(ConsentError::InvalidDecision)?;
         let approval = approval::sign(
             &self.key,
             &self.binding,

@@ -30,6 +30,8 @@ pub const MAX_TTL_SECS: i64 = 120;
 pub const MAX_APPROVAL_BYTES: usize = crate::limits::APPROVAL;
 /// Maximum trackers in one approval.
 pub const MAX_TRACKERS: usize = 32;
+/// Maximum decks (groups of trackers) in one approval.
+pub const MAX_DECKS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,46 +40,70 @@ pub enum Decision {
     Deny,
 }
 
-/// Only `read` exists in v1.
+/// What the owner allowed. `read` is the original (v1) access; `read_write`
+/// lets the app's agent tools change data too, inside the same scope. The edge
+/// treats both alike (it only carries the scope); the origin app enforces them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Access {
     Read,
+    ReadWrite,
 }
 
-/// What the owner approved: `{"v":1,"access":"read","trackers":[...]}`.
-/// `trackers` are the app's resource ids (Wiskit tracker ids); sorted, unique,
-/// 1..=32, each `^[A-Za-z0-9_-]{1,64}$`.
+/// What the owner approved: `{"v":1,"access":"read","trackers":[...]}`, plus
+/// optionally `"decks":[...]` (groups of trackers, resolved by the app at each
+/// call). `trackers` and `decks` are the app's resource ids (Wiskit ids); each
+/// list sorted, unique, `^[A-Za-z0-9_-]{1,64}$`, at most 32; together at least one
+/// id. A scope without decks serializes exactly as it always has.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceScope {
     pub v: u8,
     pub access: Access,
+    #[serde(default)]
     pub trackers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decks: Vec<String>,
 }
 
 impl ResourceScope {
-    /// Build a read scope; sorts and deduplicates.
+    /// Build a read scope over trackers; sorts and deduplicates.
     pub fn read(trackers: impl IntoIterator<Item = String>) -> Result<Self, ApprovalError> {
+        Self::new(Access::Read, trackers, Vec::new())
+    }
+
+    /// Build a scope over trackers and/or decks; sorts and deduplicates both.
+    pub fn new(
+        access: Access,
+        trackers: impl IntoIterator<Item = String>,
+        decks: impl IntoIterator<Item = String>,
+    ) -> Result<Self, ApprovalError> {
         let mut trackers: Vec<String> = trackers.into_iter().collect();
         trackers.sort();
         trackers.dedup();
+        let mut decks: Vec<String> = decks.into_iter().collect();
+        decks.sort();
+        decks.dedup();
         let s = Self {
             v: 1,
-            access: Access::Read,
+            access,
             trackers,
+            decks,
         };
         s.validate()?;
         Ok(s)
     }
 
     pub fn validate(&self) -> Result<(), ApprovalError> {
-        let sorted_unique = self.trackers.windows(2).all(|w| w[0] < w[1]);
+        fn ok_ids(list: &[String], max: usize) -> bool {
+            list.len() <= max
+                && list.windows(2).all(|w| w[0] < w[1])
+                && list.iter().all(|t| ids::is_token(t, 1, 64))
+        }
         if self.v != 1
-            || self.trackers.is_empty()
-            || self.trackers.len() > MAX_TRACKERS
-            || !sorted_unique
-            || !self.trackers.iter().all(|t| ids::is_token(t, 1, 64))
+            || (self.trackers.is_empty() && self.decks.is_empty())
+            || !ok_ids(&self.trackers, MAX_TRACKERS)
+            || !ok_ids(&self.decks, MAX_DECKS)
         {
             return Err(ApprovalError::InvalidScope);
         }
@@ -513,6 +539,81 @@ mod tests {
                 "{claim}"
             );
         }
+    }
+
+    #[test]
+    fn a_read_scope_without_decks_serializes_as_before() {
+        let s =
+            ResourceScope::read(["t2".to_string(), "t1".to_string(), "t1".to_string()]).unwrap();
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"v":1,"access":"read","trackers":["t1","t2"]}"#
+        );
+        let parsed: ResourceScope =
+            serde_json::from_str(r#"{"v":1,"access":"read","trackers":["t1"]}"#).unwrap();
+        assert_eq!(parsed.decks, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_read_write_deck_scope_round_trips_through_an_approval() {
+        let scope = ResourceScope::new(
+            Access::ReadWrite,
+            Vec::<String>::new(),
+            ["deck_b".to_string(), "deck_a".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&scope).unwrap(),
+            r#"{"v":1,"access":"read_write","trackers":[],"decks":["deck_a","deck_b"]}"#
+        );
+        let a = sign(
+            &origin_key(),
+            &binding(),
+            Decision::Approve,
+            Some(scope.clone()),
+            Some(3600),
+            NOW,
+            60,
+        )
+        .unwrap();
+        let claims = verify(&a, &binding(), NOW).unwrap();
+        assert_eq!(claims.resource_scope, Some(scope));
+    }
+
+    #[test]
+    fn scope_shapes_that_are_refused() {
+        let id = |n: usize| (0..n).map(|i| format!("d{i:02}")).collect::<Vec<_>>();
+        assert_eq!(
+            ResourceScope::new(
+                Access::ReadWrite,
+                Vec::<String>::new(),
+                Vec::<String>::new()
+            ),
+            Err(ApprovalError::InvalidScope)
+        );
+        assert_eq!(
+            ResourceScope::new(Access::Read, Vec::<String>::new(), id(MAX_DECKS + 1)),
+            Err(ApprovalError::InvalidScope)
+        );
+        assert_eq!(
+            ResourceScope::new(Access::Read, Vec::<String>::new(), ["bad id".to_string()]),
+            Err(ApprovalError::InvalidScope)
+        );
+        let unsorted = ResourceScope {
+            v: 1,
+            access: Access::Read,
+            trackers: vec![],
+            decks: vec!["b".into(), "a".into()],
+        };
+        assert_eq!(unsorted.validate(), Err(ApprovalError::InvalidScope));
+        assert!(serde_json::from_str::<ResourceScope>(
+            r#"{"v":1,"access":"write","trackers":["t"]}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ResourceScope>(
+            r#"{"v":1,"access":"read","trackers":["t"],"extra":1}"#
+        )
+        .is_err());
     }
 
     #[test]
